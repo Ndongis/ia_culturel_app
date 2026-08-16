@@ -1,0 +1,1735 @@
+"""
+handler.py  —  v2
+-----------------
+RAG — Galerie Virtuelle d'Art
+Données récupérées en direct depuis les microservices (pas de CSV).
+
+Variables d'environnement :
+    GEMINI_API_KEY          clé Gemini
+    GEMINI_MODEL            gemini-2.5-flash-lite (défaut)
+    EMBED_MODEL             paraphrase-multilingual-MiniLM-L6-v2 (défaut)
+    CACHE_TTL_SECONDS       durée de vie du cache embeddings (défaut 3600)
+    ANSWER_CACHE_TTL        durée de vie du cache réponses (défaut 1800)
+    ANSWER_CACHE_SIZE       taille max du cache réponses (défaut 200)
+    EMBED_BATCH_SIZE        batch size embeddings (défaut 64)
+    TOP_K_DEFAULT           top-k par défaut (défaut 3)
+    KOKORO_VOICE            voix kokoro-onnx (défaut ff_siwis)
+    KOKORO_SPEED            vitesse TTS (défaut 1.0)
+    KOKORO_MODEL_DIR        dossier modèles onnx (défaut /app/kokoro_models)
+    TTS_MAX_CHARS           nb max de caractères (défaut 250)
+
+    URL_EXPOSITIONS         http://localhost:8282/api/expositions
+    URL_THEMES              http://localhost:8282/api/themes
+    URL_SALLES              http://localhost:8282/api/salles
+    URL_BIENS               http://localhost:8080/api/biens
+    URL_CATEGORIES          http://localhost:8080/api/categories
+    URL_ARTISTES            http://localhost:8181/api/artistes
+    URL_INSTITUTIONS        http://localhost:8383/api/institutions
+"""
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+
+import hashlib
+from http import client
+import io
+from collections import deque
+import json
+from logging import config
+import os
+import pathlib
+
+import re
+import threading
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from math import gcd
+import logging
+
+# Récupérer le logger d'uvicorn
+logger = logging.getLogger("uvicorn.error")
+
+# Dans votre route :
+
+
+from google import genai
+from google.genai import types
+
+import httpx
+import numpy as np
+import scipy.io.wavfile as _wav
+import uvicorn
+from cachetools import TTLCache
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+import psycopg2
+import torch
+from typing import Annotated
+
+# ── Config ────────────────────────────────────────────────────────────────────
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY",    "")
+GEMINI_MODEL      = os.getenv("GEMINI_MODEL",      "gemini-2.5-flash-lite")
+WHISPER_MODEL     = os.getenv("WHISPER_MODEL",     "large-v3")
+WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE",    "cuda")
+WHISPER_COMPUTE   = os.getenv("WHISPER_COMPUTE",   "float16")
+KOKORO_VOICE      = os.getenv("KOKORO_VOICE",      "ff_siwis")
+KOKORO_SPEED      = float(os.getenv("KOKORO_SPEED",      "1.0"))
+KOKORO_MODEL_DIR  = os.getenv("KOKORO_MODEL_DIR",  "/kokoro_models")
+TTS_MAX_CHARS     = int(os.getenv("TTS_MAX_CHARS", "250"))
+EMBED_MODEL       = os.getenv("EMBED_MODEL",       "intfloat/multilingual-e5-base")
+CACHE_TTL         = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
+ANSWER_CACHE_TTL  = int(os.getenv("ANSWER_CACHE_TTL",  "1800"))
+ANSWER_CACHE_SIZE = int(os.getenv("ANSWER_CACHE_SIZE",  "200"))
+EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE",   "64"))
+AUDIO_CACHE_DIR   = os.getenv("AUDIO_CACHE_DIR",   "/audio_cache")
+AUDIO_CACHE_TTL   = int(os.getenv("AUDIO_CACHE_TTL",    "86400"))
+TOP_K_DEFAULT     = int(os.getenv("TOP_K_DEFAULT",      "3"))
+API_GATEWAY = os.getenv("API_GATEWAY")
+URL_EXPOSITIONS  = f"{API_GATEWAY}/expositions/api/expositions"
+URL_THEMES       = f"{API_GATEWAY}/expositions/api/themes"
+URL_SALLES       = f"{API_GATEWAY}/expositions/api/salles"
+URL_BIENS        = f"{API_GATEWAY}/biens/api/biens"
+URL_CATEGORIES   = f"{API_GATEWAY}/biens/api/categories"
+URL_ARTISTES     = f"{API_GATEWAY}/users/api/artistes"
+URL_INSTITUTIONS = f"{API_GATEWAY}/institutions/api/institutions"
+DATABASE_URL = "postgresql://postgres:123@localhost:5432/vectordb"
+conn = None  # Connexion à la base de données (si nécessaire)
+cur = None   # Curseur pour exécuter les requêtes SQL
+_KOKORO_VOICE_MAP = {
+    "fr": os.getenv("KOKORO_VOICE_FR", "ff_siwis"),
+    "en": os.getenv("KOKORO_VOICE_EN", "af_heart"),
+    "es": os.getenv("KOKORO_VOICE_ES", "ef_dora"),
+}
+_KOKORO_LANG_MAP = {"fr": "fr-fr", "en": "en-us", "es": "es"}
+# Codes langue pour kokoro (PyTorch, KPipeline) — une lettre par langue,
+# différent du format "fr-fr" utilisé par l'ancien kokoro-onnx.
+_KOKORO_PT_LANG_CODE = {"fr": "f", "en": "a", "es": "e"}
+_KOKORO_ORIGINAL_LANG = {"fr": "francais", "en": "anglais", "es": "espagnol"}
+_SUPPORTED_LANGS = {"fr", "en", "es"}
+
+_CORS_ORIGINS_DEFAULT = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://localhost:8080"
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", _CORS_ORIGINS_DEFAULT).split(",")
+    if o.strip()
+]
+
+SYSTEM_PROMPT = """Tu es un guide expert et passionné de culture et d'art. Tu connais parfaitement les œuvres, les artistes, les expositions et les institutions.
+Réponds dans la langue reçue de façon naturelle, chaleureuse et engageante.
+Reponds aux questions en s'appuyant uniquement sur les informations fournies dans le contexte. Ne dites pas des choses qu'on ne vous a pas demandé et ne dites pas Ah: 
+Fais la différence entre une œuvre, un portrait et un document.
+Si une information n'est pas dans le contexte, dis-le honnêtement sans inventer.
+La salle et l'exposition actuelle ou se trouve l'utilisateur represente sa localisation
+RÈGLES STRICTES sur le statut des biens — ne jamais enfreindre :
+1. Un bien est exposé SEULEMENT si son document contient "Statut : ACTUELLEMENT EXPOSÉ".
+   Si le document dit "Statut : EN RÉSERVE", l'œuvre N'EST PAS exposée, même si elle appartient à un artiste ou une institution mentionnés.
+2. Ne JAMAIS déduire qu'une œuvre est exposée parce qu'elle appartient à un artiste ou une institution.
+3. Ne JAMAIS inventer une relation salle/exposition absente du contexte.
+
+RÈGLE DE LONGUEUR : réponds en 1 à 3 phrases courtes (environ 250 caractères maximum). Termine toujours ta dernière phrase correctement, quitte à dépasser légèrement cette longueur.
+
+Un historique des échanges précédents peut t'être fourni pour garder le fil de la conversation. Si c'est le cas, ne salue PAS de nouveau (pas de "bonjour", "bonsoir", etc.) et ne dites en disant le nom de la salle et l'exposition :
+réponds directement à la question, comme dans une conversation déjà entamée. Salue uniquement s'il n'y a aucun historique fourni (première question de la visite) et que l'utilisateur te salue lui-même.
+"""
+
+EXPLAIN_SYSTEM_PROMPT = """Tu es un guide de musée expert, passionné et chaleureux.
+Un visiteur se trouve devant un bien culturel spécifique.
+Explique ce bien de façon naturelle, engageante et accessible.
+Ne dites pas bonjour, commencer par vous vous trouvez devant le bien ou quel chose dans le genre.
+Appuie-toi uniquement sur les informations du contexte fourni.
+Si une information manque, dis-le honnêtement sans inventer.
+Ne confondez pas oeuvre, portrait et document
+Parle avec la langue que tu recevra dans la requete (ex: "fr", "en", "es").
+RÈGLE DE LONGUEUR : génére au maximum 150 caractéres
+Ne coupe JAMAIS une phrase en plein milieu."""
+
+CREATE_CREATIONS_PROMPT="""Tu es un guide expert et passionné de culture et d'art, avec une connaissance fine des œuvres, des artistes, des expositions et des institutions.
+ 
+À partir de la question précédente du visiteur (et de la réponse donnée, si elle est fournie), propose EXACTEMENT 3 nouvelles questions pertinentes, courtes et formulées naturellement, que le visiteur pourrait poser ensuite pour approfondir sa visite.
+Si la derniere question n'est pas specifiée base tout juste sur l'exposition, la salle et l'institution actuelle.
+Règles de contexte :
+- Si des extraits de documents de référence sont fournis, base tes questions UNIQUEMENT sur les informations qu'ils contiennent (œuvres, artistes, salles, expositions, thèmes réellement présents) : n'invente aucun fait, nom ou détail qui n'y figure pas.
+- Si un bien culturel précis est en focus, concentre les 3 questions sur ce bien, jusqu'à ce que le visiteur pose lui-même une question en dehors de ce bien.
+- Si la question précédente porte sur une information générale (objet, bien, exposition, salle, thème), varie les angles des questions en piochant parmi, par exemple :
+  - la description de l'œuvre ou du sujet
+  - le sujet ou le thème représenté
+  - la technique ou le matériau utilisé
+  - le contexte historique ou l'artiste
+  - un lien avec d'autres œuvres, salles ou expositions
+  Ne couvre pas systématiquement tous ces angles : choisis les plus pertinents selon ce qui a déjà été dit.
+- Ne propose jamais une question déjà posée dans l'historique de la conversation, ni une simple reformulation d'une question précédente.
+- Formule les questions comme si c'était le visiteur lui-même qui les posait : naturelles, courtes, sans tournure robotique ou générique.
+- Priorise toi sur l'exposition, la salle et l'institution actuelle avant tout et si le bien culturel est present, mets la priorité sur lui avant et donne des questions que tu me répondre sans problémes.
+- Ne pas confondre documents, oeuvres et portrait
+Format de réponse :
+- Réponds dans la même langue que celle reçue dans la requête.
+- Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte avant ni après, sans balises Markdown, au format exact suivant :
+{"questions": ["Question 1 ?", "Question 2 ?", "Question 3 ?""]}
+"""
+
+# ── État global ───────────────────────────────────────────────────────────────
+
+_model:          SentenceTransformer   = None
+_llm = None
+_embeddings:     np.ndarray            = None
+
+_metadata:       list[dict]            = []
+_cache_built_at: float                 = 0.0
+_answer_cache:   TTLCache              = None
+# Historique des 3 derniers échanges (question, réponse) par visiteur (guest_id),
+# pour donner du contexte de conversation à Gemini sans mélanger les visiteurs
+# entre eux. Durée de validité illimitée (pas de TTL, simple dict) : l'historique
+# d'un visiteur n'expire jamais et n'est jamais purgé automatiquement tant que
+# le serveur tourne (redémarrage = remise à zéro puisque tout est en mémoire).
+_conversation_histories: dict         = None
+HISTORY_MAXLEN = 3
+_audio_cache:    dict                  = {}
+_kokoro_pipelines: dict                = {}
+_whisper_model                         = None
+data = None
+
+# ── Helpers langue ────────────────────────────────────────────────────────────
+
+def _resolve_lang(langue: str | None) -> str:
+    if langue and langue.lower()[:2] in _SUPPORTED_LANGS:
+        return langue.lower()[:2]
+    return "fr"
+
+
+# ── Récupération HTTP ─────────────────────────────────────────────────────────
+
+def _fetch_one(url: str, label: str) -> list[dict]:
+    try:
+        resp = httpx.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("results", data.get("data", []))
+        else:
+            rows = []
+        print(f"  {label} : {len(rows)} enregistrements")
+        return rows
+    except Exception as exc:
+        print(f"  WARN : {label} inaccessible ({url}) → {exc}")
+        return []
+
+
+def fetch_all_parallel() -> dict[str, list[dict]]:
+    sources = {
+        "biens":        (URL_BIENS,        "Biens"),
+        "categories":   (URL_CATEGORIES,   "Catégories"),
+        "artistes":     (URL_ARTISTES,     "Artistes"),
+        "expositions":  (URL_EXPOSITIONS,  "Expositions"),
+        "themes":       (URL_THEMES,       "Thèmes"),
+        "salles":       (URL_SALLES,       "Salles"),
+        "institutions": (URL_INSTITUTIONS, "Institutions"),
+    }
+    results: dict[str, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        futures = {pool.submit(_fetch_one, url, lbl): key for key, (url, lbl) in sources.items()}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+# ============================================================
+# BUILD TEXT FUNCTIONS
+# ============================================================
+# ============================================================
+# BUILD TEXT CATEGORIES
+# ============================================================
+
+def build_text_categorie(item):
+    text = f"""
+Type: Catégorie
+Nom : {item.get('nom', 'Aucun')}
+Description : {item.get('description', 'Aucun')}
+Contexte: C'est une catégorie de classification des biens culturels
+"""
+    return text.strip()
+
+def embed_categories(items):
+    texts = [build_text_categorie(i) for i in items]
+    embeddings = _model.encode(texts, batch_size=32, show_progress_bar=True)
+    return texts, embeddings
+
+def insert_categories(items):
+    texts, embeddings = embed_categories(items)
+    for i, item in enumerate(items):
+        print(f"embedding categorie {i+1}/{len(items)}")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "categorie",
+                "id": item.get("id"),
+            })
+        ))
+    conn.commit()
+    print(f"✅ {len(items)} catégories insérées.")
+
+#insert_categories(data['categories'])
+
+def build_text_bien(bien):
+
+  text=f"""
+Type de bien culturel: {bien.get('type','Aucun')}
+Œuvre : {bien.get('titre','Aucun')}
+Description : {bien.get('description','Aucun')}
+Historique : {bien.get('historique','Aucun ')}
+Technique : {bien.get('technique','')}
+Sujet : {bien.get('sujet','Aucun')}
+Inscription : {bien.get('inscription','')}
+Auteur : {bien.get('auteur','Aucun')}
+Contexte: c'est un bien culturel qui appartient à une institution
+
+"""
+  categories=bien.get('categories')
+ # print(categories[0]["nom"])
+  print(f"categorie {type(categories)}")
+  if categories is not None :
+    for categorie in categories:
+      if type(categorie)!=str:
+        text+=f"Categorie : {categorie.get('nom')}"
+      break
+
+  institution=None
+  institution_id=bien.get("institution_id")
+
+  if institution_id is not None:
+    for inst in data["institutions"]:
+        if inst.get("id") == institution_id:
+            institution = inst
+            text+=f" Institution : {institution.get('nom')}"
+            break
+
+
+  return text.strip()
+
+# ============================================================
+# BUILD TEXT BIENS
+# ============================================================
+
+def embed_biens(biens):
+    texts = [build_text_bien(b) for b in biens]
+
+    embeddings = _model.encode(
+        texts,
+        batch_size=32,   # important pour performance
+        show_progress_bar=True
+    )
+
+    return texts, embeddings
+
+def insert_biens(biens):
+    texts, embeddings = embed_biens(biens)
+
+    for i, bien in enumerate(biens):
+        print("embedding")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "bien",
+                "id": bien.get("id"),
+                "institution_id": bien.get("institution_id"),
+                "artiste_UNCTIONSid": bien.get("artiste_id"),
+            })
+        )),
+
+
+    conn.commit()
+
+# ============================================================
+# BUILD TEXT THEMES
+# ============================================================
+def build_text_theme(item):
+    text = f"""
+Nom : {item.get('nom', 'Aucun')}
+Description : {item.get('description', 'Aucun')}
+Contexte: C'est un thème associé à des biens culturels ou expositions
+"""
+    return text.strip()
+
+
+def embed_themes(items):
+    texts = [build_text_theme(i) for i in items]
+    embeddings = _model.encode(texts, batch_size=32, show_progress_bar=True)
+    return texts, embeddings
+
+
+def insert_themes(items):
+    texts, embeddings = embed_themes(items)
+    for i, item in enumerate(items):
+        print(f"embedding theme {i+1}/{len(items)}")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "theme",
+                "id": item.get("id"),
+            })
+        ))
+    conn.commit()
+    print(f"✅ {len(items)} thèmes insérés.")
+
+# ============================================================
+# BUILD TEXT SALLES
+# ============================================================
+
+def build_text_salle(item):
+    text = f"""
+Nom : {item.get('nom', 'Aucun')}
+Contexte: C'est une salle appartenant à une exposition
+"""
+    exposition = item.get('exposition')
+    print("salle")
+    print(exposition.get("id") )
+    if exposition.get("id") is not None:
+        for expo in data["expositions"]:
+            print(expo.get('id'))
+            if expo.get("id") == exposition.get("id") :
+
+                text += f"\nExposition : {expo.get('nom')}"
+                break
+
+ # 1. On extrait uniquement les titres des biens qui appartiennent à cette salle
+    titres_biens = [
+      bien.get("titre", "Sans titre")
+      for bien in data.get("biens", [])
+      if bien.get("salle_id") == item.get("id")
+]
+
+# 2. On affiche le préfixe une seule fois, suivi de la liste ou de "Aucun"
+    if titres_biens:
+      # Joint les titres par une virgule (ex: "Peinture A, Sculpture B, Vase C")
+      liste_titres = ", ".join(titres_biens)
+      text += f"\nBien culturel exposé: {liste_titres}"
+    else:
+      text += "\nBien culturel exposé: Aucun"
+
+    print(text)
+    return text.strip()
+
+def embed_salles(items):
+    texts = [build_text_salle(i) for i in items]
+    embeddings = _model.encode(texts, batch_size=32, show_progress_bar=True)
+    return texts, embeddings
+
+def insert_salles(items):
+    texts, embeddings = embed_salles(items)
+    for i, item in enumerate(items):
+        print(f"embedding salle {i+1}/{len(items)}")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "salle",
+                "id": item.get("id"),
+                "institution_id": item.get("institution_id"),
+            })
+        ))
+    conn.commit()
+    print(f"✅ {len(items)} salles insérées.")
+
+# ============================================================
+# BUILD TEXT EXPOSITIONS
+# ============================================================
+def build_text_exposition(item):
+    text = f"""
+Nom : {item.get('nom', 'Aucun')}
+Description : {item.get('description', 'Aucun')}
+Contexte: C'est une exposition organisée par une institution culturelle
+"""
+    institution_id = item.get('institution_id')
+    if institution_id is not None:
+        for inst in data["institutions"]:
+            if inst.get('id') == institution_id:
+                text += f"\nInstitution : {inst.get('nom')}"
+                break
+
+    salle_id = item.get('salle_id')
+    if salle_id is not None:
+        text+=f"\nSalles : "
+        for salle in data.get('salles', []):
+            if salle.get('id') == salle_id:
+                text += f"{salle.get('nom')} "
+                break
+
+    themes = data["themes"]
+    item_themes = item.get("themes")  # liste d'ids directement [{id: ...}, ...]
+
+    # 1. On extrait les noms des thèmes correspondants en évitant les boucles imbriquées manuelles
+    noms_themes = [
+      theme.get("nom", "Sans nom")
+    for item_theme in (item_themes or [])
+      for theme in themes
+        if theme.get("id") == item_theme.get("id")
+      ]
+
+# 2. On ajoute au texte une seule fois avec la liste ou "Aucun"
+    if noms_themes:
+      text += f"\nThèmes : {', '.join(noms_themes)}"
+    else:
+      text += "\nThèmes : Aucun"
+    #print(text)
+    return text.strip()
+def embed_expositions(items):
+    texts = [build_text_exposition(i) for i in items]
+    embeddings = _model.encode(texts, batch_size=32, show_progress_bar=True)
+    return texts, embeddings
+
+def insert_expositions(items):
+    texts, embeddings = embed_expositions(items)
+    for i, item in enumerate(items):
+        print(f"embedding exposition {i+1}/{len(items)}")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "exposition",
+                "id": item.get("id"),
+                "institution_id": item.get("institution_id"),
+                "salle_id": item.get("salle_id"),
+            })
+        ))
+    conn.commit()
+    print(f"✅ {len(items)} expositions insérées.")
+
+# ============================================================
+# BUILD TEXT ARTISTE
+# ============================================================
+def build_text_artiste(item):
+    text = f"""
+Type: Artiste
+Nom : {item.get('nom', 'Aucun')}
+Prénom : {item.get('prenom', 'Aucun')}
+Biographie : {item.get('biographie', 'Aucun')}
+Nationalité : {item.get('nationalite', 'Aucun')}
+Date de naissance : {item.get('date_naissance', 'Aucun')}
+Date de décès : {item.get('date_deces', 'Aucun')}
+Contexte: C'est un artiste associé à des biens culturels
+"""
+    return text.strip()
+
+def embed_artistes(items):
+    global data
+    texts = [build_text_artiste(i) for i in items]
+    embeddings = _model.encode(texts, batch_size=32, show_progress_bar=True)
+    return texts, embeddings
+
+def insert_artistes(items):
+    texts, embeddings = embed_artistes(items)
+    for i, item in enumerate(items):
+        print(f"embedding artiste {i+1}/{len(items)}")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "artiste",
+                "id": item.get("id"),
+            })
+        ))
+    conn.commit()
+    print(f"✅ {len(items)} artistes insérés.")
+
+# ============================================================
+# BUILD TEXT INSTITUTIONS
+# ============================================================
+def build_text_inst(institution):
+  global data
+  text=  f"""
+Nom : {institution.get('nom','Aucun')}
+Description : {institution.get('description','Aucun')}
+adresse : {institution.get('adresse','Aucun')}
+numero_telephone : {institution.get('numero_telephone','Aucun ')}
+"""
+
+  # 1. On extrait les noms de toutes les expositions liées à cette institution
+  noms_expos = [
+    expo.get("nom", "Sans nom")
+    for expo in data["expositions"]
+    if expo.get("institution_id") == institution.get("id")
+  ]
+
+  # 2. On ajoute au texte une seule fois avec la liste ou "Aucun"
+  if noms_expos: 
+    # Joint les noms s'il y en a plusieurs (ex: "Expo Peinture, Rétrospective Sculpteur")
+    text += f"\nExpositions : {', '.join(noms_expos)}"
+  else:
+    text += "\nExpositions : Aucun"
+  return text.strip()
+
+def embed_institutions(institutions):
+    texts = [build_text_inst(i) for i in institutions]
+
+    embeddings = _model.encode(
+        texts,
+        batch_size=32,   # important pour performance
+        show_progress_bar=True
+    )
+
+    return texts, embeddings
+
+def insert_institutions(institutions):
+    texts, embeddings = embed_institutions(institutions)
+
+    for i, institution in enumerate(institutions):
+        print("embedding")
+        cur.execute("""
+            INSERT INTO rag_documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+        """, (
+            texts[i],
+            embeddings[i].tolist(),
+            json.dumps({
+                "type": "institution",
+                "id": institution.get("id"),
+
+            })
+        )),
+
+
+    conn.commit()
+
+
+
+def build_embeddings() -> None:
+    global  data
+
+    data = None
+    data = fetch_all_parallel()
+    print(f"✅ Données récupérées : {', '.join(f'{k}={len(v)}' for k,v in data.items())}")
+    conn.rollback()
+    cur.execute("""
+    DELETE FROM rag_documents;
+    """)
+    conn.commit()
+    
+    insert_institutions(data['institutions'])
+    insert_artistes(data["artistes"])
+    insert_expositions(data["expositions"])
+    insert_salles(data["salles"])
+    insert_themes(data['themes'])
+    insert_categories(data['categories'])
+    insert_biens(data['biens'])
+
+def embed_question(question):
+    return _model.encode(question).tolist()
+
+def search_documents(question: str, top_k: int = 4):
+    global cur, conn
+    question_embedding = embed_question(question)
+    
+    if cur is None:
+        return []
+
+    try:
+        conn.rollback()
+        # 🌟 Correction : On sélectionne l'opérateur de distance dans le SELECT pour avoir le score
+        cur.execute("""
+            SELECT content, metadata, (embedding <-> %s::vector) AS distance
+            FROM rag_documents
+            ORDER BY embedding <-> %s::vector
+            LIMIT %s;
+        """, (question_embedding, question_embedding, top_k))
+
+        rows = cur.fetchall()  # rows contient maintenant (content, metadata, distance)
+        
+        results = []
+        for r in rows:
+            meta = r[1] if isinstance(r[1], dict) else json.loads(r[1] or '{}')
+            
+            # 🌟 Calcul du titre dynamique basé sur les métadonnées de l'objet indexé
+            doc_type = meta.get("type", "document")
+            
+            results.append({
+                "contenu": r[0],
+                "type": doc_type,
+                # On utilise le titre ou nom s'il est présent dans les métadonnées lors de l'indexation
+                "titre": meta.get("nom", meta.get("titre", doc_type.capitalize())),
+                "score": float(r[2]) if len(r) > 2 else 0.0  # Récupération de la distance SQL
+            })
+
+        return results
+
+    except Exception as exc:
+        print(f"❌ Erreur pgvector : {exc}")
+        if conn:
+            conn.rollback()
+        return []
+
+
+
+def get_rag_documents() -> list[str]:
+    """Récupère le contenu texte (`content`) de tous les documents RAG,
+    sans passer par l'embedding/similarité (contrairement à search_documents)."""
+    global cur, conn
+    if cur is None:
+        return []
+    try:
+        conn.rollback()
+        cur.execute("""
+            SELECT content FROM rag_documents;
+        """)
+        lignes = cur.fetchall()
+        # 'ligne' est un tuple, le contenu est le premier élément (index 0)
+        return [ligne[0] for ligne in lignes]
+    except Exception as exc:
+        print(f"❌ Erreur pgvector (get_rag_documents) : {exc}")
+        if conn:
+            conn.rollback()
+        return []
+
+
+# ── Génération de réponse ─────────────────────────────────────────────────────
+
+def _history_key(guest_id: str | None, salle_nom: str | None = None,
+                  exposition_nom: str | None = None, bien_titre: str | None = None) -> str | None:
+    """Construit la clé d'historique à partir du visiteur et de son contexte de
+    visite (salle / exposition / bien_titre, tous optionnels). Deux visiteurs
+    identiques mais dans un contexte différent (ex: focus sur une autre œuvre)
+    obtiennent ainsi des fils de conversation séparés."""
+    if not guest_id:
+        return None
+    return "|".join([guest_id, salle_nom or "", exposition_nom or "", bien_titre or ""])
+
+
+def _get_history(guest_id: str | None, salle_nom: str | None = None,
+                  exposition_nom: str | None = None, bien_titre: str | None = None) -> deque:
+    """Retourne (en la créant si besoin) le deque d'historique pour ce visiteur
+    dans ce contexte (salle/exposition/bien_titre)."""
+    key = _history_key(guest_id, salle_nom, exposition_nom, bien_titre)
+    if not key or _conversation_histories is None:
+        return deque(maxlen=HISTORY_MAXLEN)
+    hist = _conversation_histories.get(key)
+    if hist is None:
+        hist = deque(maxlen=HISTORY_MAXLEN)
+        _conversation_histories[key] = hist
+    return hist
+
+
+def _append_history(guest_id: str | None, question: str, answer: str,
+                     salle_nom: str | None = None, exposition_nom: str | None = None,
+                     bien_titre: str | None = None) -> None:
+    """Ajoute l'échange (question, réponse) à l'historique de ce visiteur/contexte."""
+    key = _history_key(guest_id, salle_nom, exposition_nom, bien_titre)
+    if not key or _conversation_histories is None:
+        return
+    hist = _get_history(guest_id, salle_nom, exposition_nom, bien_titre)
+    hist.append((question, answer))
+    _conversation_histories[key] = hist
+
+
+def _build_history_block(guest_id: str | None, salle_nom: str | None = None,
+                          exposition_nom: str | None = None, bien_titre: str | None = None) -> str:
+    """Formate les derniers échanges du visiteur (pour ce contexte) pour les
+    insérer dans le prompt, afin que Gemini garde le fil de la conversation."""
+    hist = _get_history(guest_id, salle_nom, exposition_nom, bien_titre)
+    if not hist:
+        return ""
+    tours = [f"Visiteur : {q}\nGuide : {a}" for q, a in hist]
+    return "Historique de la conversation (derniers échanges) :\n" + "\n\n".join(tours) + "\n\n"
+
+
+def _build_prompt(question: str, results: list,
+                  salle_nom: str | None = None, exposition_nom: str | None = None,
+                  institution_nom: str | None = None, langue: str = None,
+                  guest_id: str | None = None, bien_titre: str | None = None) -> str:
+    location_parts = []
+    if salle_nom:        location_parts.append(f"Salle actuelle : {salle_nom}")
+    if exposition_nom:   location_parts.append(f"Exposition en cours : {exposition_nom}")
+    if institution_nom:  location_parts.append(f"Institution : {institution_nom}")
+    if bien_titre:        location_parts.append(f"Bien culturel en focus : {bien_titre}")
+
+    location_block = ("Localisation du visiteur :\n" + "\n".join(location_parts) + "\n\n") if location_parts else ""
+    history_block = _build_history_block(guest_id, salle_nom, exposition_nom, bien_titre)
+    print(f"[LANGUE] {langue}")
+    
+    if not results:
+        return f"Tu dois générer ta réponse finale UNIQUEMENT dans la langue suivante LANGUE OBLIGATOIRE {langue} {SYSTEM_PROMPT}\n\n{location_block}{history_block}Aucun document.\n\nQuestion : {question}."
+
+    # ── CONSTRUCTION SÉCURISÉE DU CONTEXTE (Accepte les dictionnaires et les tuples bruts) ──
+    context_parts = []
+    for r in results:
+        if isinstance(r, dict):
+            # Format dictionnaire propre (issu de notre search_documents corrigé)
+            r_type = str(r.get('type', 'inconnu')).upper()
+            r_titre = r.get('titre', 'Document')
+            # On utilise .get('contenu') car c'est la clé définie lors de la conversion
+            r_contenu = r.get('contenu', r.get('content', ''))
+            context_parts.append(f"[{r_type}] {r_titre}\n{r_contenu}")
+            
+        elif isinstance(r, (tuple, list)) and len(r) >= 2:
+            # Format tuple de secours (si cur.fetchall() est passé directement sans conversion)
+            content_brut = r[0]
+            meta_brut = r[1]
+            
+            if isinstance(meta_brut, str):
+                try:
+                    meta = json.loads(meta_brut or '{}')
+                except Exception:
+                    meta = {}
+            elif isinstance(meta_brut, dict):
+                meta = meta_brut
+            else:
+                meta = {}
+                
+            r_type = str(meta.get('type', 'inconnu')).upper()
+            r_titre = str(meta.get('type', 'Document')).capitalize()
+            context_parts.append(f"[{r_type}] {r_titre}\n{content_brut}")
+
+    context = "\n\n---\n\n".join(context_parts)
+    print(f"[Context] {context}")
+    return f"Tu dois générer ta réponse finale UNIQUEMENT dans la langue suivante LANGUE OBLIGATOIRE {langue} {SYSTEM_PROMPT}\n\n{location_block}{history_block}Contexte :\n{context}\n\nQuestion : {question}.  "
+
+
+def generate_answer(question: str, results: list,
+                    salle_nom: str | None = None, exposition_nom: str | None = None,
+                    institution_nom: str | None = None,
+                    langue: str | None = None, guest_id: str | None = None,
+                    bien_titre: str | None = None) -> str:
+    if not _llm:
+        return "Le modèle IA n'est pas configuré (GEMINI_API_KEY manquante)."
+
+    # ── 1. Génération de la clé de cache sans risque de crash ──
+    cache_parts = []
+    for r in results:
+        if isinstance(r, dict):
+            # Recherche de 'contenu' ou 'content' de manière fluide
+            cache_parts.append(str(r.get('contenu', r.get('content', '')))[:30])
+        elif isinstance(r, (tuple, list)) and len(r) > 0:
+            cache_parts.append(str(r[0])[:30])
+
+    # guest_id (+ contexte salle/exposition/bien_titre) inclus dans la clé :
+    # une même question ne doit pas retourner une réponse mise en cache pour
+    # un autre visiteur, ou pour le même visiteur dans un contexte différent
+    # (historique différent selon l'endroit / l'œuvre en focus).
+    cache_key = f"{question}_{salle_nom}_{exposition_nom}_{institution_nom}_{langue}_{guest_id}_{bien_titre}_{'|'.join(cache_parts)}"
+    
+    # ── 2. Vérification du cache ──
+    if _answer_cache is not None and cache_key in _answer_cache:
+        print(f"[Cache] Hit : {question[:50]}")
+        return _answer_cache[cache_key]
+
+    # ── 3. Génération via le LLM (Gemini) ──
+    try:
+        # Nettoyage et récupération de la langue cible
+        langue_str = str(langue).strip().lower() if langue else "fr"
+        langue_resolue = _KOKORO_ORIGINAL_LANG.get(langue_str, "francais")
+        print(f"[Génération] Question : {question[:50]} | Langue : {langue_resolue} | Visiteur : {guest_id} | Bien : {bien_titre}")
+        # Construction sécurisée du prompt
+        prompt_complet = _build_prompt(question, results, salle_nom, exposition_nom, institution_nom,
+                                        langue=langue_resolue, guest_id=guest_id, bien_titre=bien_titre)
+        
+        print(f"[AVANT GEN]...")  # Affiche les 200 premiers caractères du prompt
+        # Requête à l'API Gemini
+        response = _llm.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt_complet,
+        config=types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=800,
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=500
+            ),
+        ),
+        )
+        print(f"[APRES GEN]...{len(prompt_complet)}")
+        
+        if response and hasattr(response, 'text') and response.text:
+            answer = response.text
+        else:
+            answer = "Désolé, je ne parviens pas à formuler une réponse textuelle."
+        
+        # Sauvegarde dans le cache
+        if _answer_cache is not None:
+            _answer_cache[cache_key] = answer
+
+        # Ajout à l'historique de ce visiteur, pour ce contexte (salle/expo/bien_titre)
+        _append_history(guest_id, question, answer, salle_nom, exposition_nom, bien_titre)
+
+        return answer
+        
+    except Exception as exc:
+        print(f"❌ ERROR Gemini : {exc}")
+        return f"Erreur lors de la génération : {exc}"
+
+
+def generate_suggested_questions(question: str | None = None, answer: str | None = None,
+                                  langue: str | None = None,
+                                  documents: list[str] | None = None) -> list[str]:
+    """Génère 5 questions de suivi, en s'appuyant sur CREATE_CREATIONS_PROMPT.
+    - question/answer : dernier échange du visiteur, si disponible (contexte conversationnel).
+    - documents : extraits de documents RAG (contenu réel des œuvres/salles/expositions)
+      sur lesquels ancrer les questions, pour éviter que le LLM n'en invente.
+    Renvoie une liste de 0 à 5 chaînes ; liste vide en cas d'échec (LLM absent, JSON invalide, etc.)."""
+    if not _llm:
+        return []
+
+    langue_str = str(langue).strip().lower() if langue else "fr"
+    langue_resolue = _KOKORO_ORIGINAL_LANG.get(langue_str, "francais")
+
+    contexte = ""
+    if question:
+        contexte += f"Question précédente du visiteur : {question}"
+    if answer:
+        contexte += f"\nRéponse donnée au visiteur : {answer}"
+
+    if documents:
+        # Chaque extrait est tronqué pour ne pas exploser la taille du prompt
+        extraits = "\n".join(f"- {str(d).strip()[:400]}" for d in documents if str(d).strip())
+        if extraits:
+            contexte += f"\n\nExtraits de documents de référence disponibles :\n{extraits}"
+
+    if not contexte.strip():
+        contexte = "Aucune question précédente ni document disponible : propose des questions d'accueil générales et engageantes."
+    
+    prompt = f"Tu dois générer ta réponse finale UNIQUEMENT dans la langue suivante LANGUE OBLIGATOIRE {langue_resolue} {CREATE_CREATIONS_PROMPT}\n\n{contexte}\n\n"
+   
+    try:
+        response = _llm.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.4,
+                max_output_tokens=2000,
+                thinking_config=types.ThinkingConfig(thinking_budget=1500),
+                response_mime_type="application/json",
+            ),
+        )
+        raw = response.text if response and hasattr(response, "text") and response.text else "{}"
+        raw = raw.strip()
+        # Sécurité : au cas où le modèle entourerait quand même la réponse de ```json ... ```
+        raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+
+        data = json.loads(raw)
+        questions = data.get("questions", [])
+        if not isinstance(questions, list):
+            return []
+        # On force la sortie à 2 questions maximum, sous forme de chaînes propres
+        return [str(q).strip() for q in questions[:3] if str(q).strip()]
+
+    except Exception as exc:
+        print(f"❌ ERROR generate_suggested_questions : {exc}")
+        return []
+
+
+# ── TTS — Kokoro (PyTorch) ────────────────────────────────────────────────────
+
+def _audio_cache_key(text: str) -> str:
+    return hashlib.md5(text.strip().encode()).hexdigest()
+
+
+def _get_cached_audio(key: str) -> str | None:
+    if key in _audio_cache:
+        wav_path, ts = _audio_cache[key]
+        if (time.time() - ts) < AUDIO_CACHE_TTL and pathlib.Path(wav_path).exists():
+            print(f"[CACHE] Hit audio : {key[:16]}")
+            return wav_path
+        del _audio_cache[key]
+    return None
+
+
+def _set_cached_audio(key: str, wav_path: str) -> None:
+    _audio_cache[key] = (wav_path, time.time())
+    if len(_audio_cache) > 500:
+        for k, _ in sorted(_audio_cache.items(), key=lambda x: x[1][1])[:100]:
+            del _audio_cache[k]
+    print(f"[CACHE] Sauvegardé audio : {key[:16]}")
+
+
+def kokoro_ready() -> bool:
+    return bool(_kokoro_pipelines)
+
+
+def _load_kokoro() -> None:
+    global _kokoro_pipelines
+    from kokoro import KPipeline
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[TTS] Chargement kokoro (PyTorch, device={device})...")
+    t0 = time.time()
+    for lang, pt_lang_code in _KOKORO_PT_LANG_CODE.items():
+        _kokoro_pipelines[lang] = KPipeline(lang_code=pt_lang_code, device=device)
+    # Warm-up : évite de payer le coût du premier appel (recherche d'algo
+    # cuDNN, allocation mémoire) au moment où un vrai visiteur pose une question.
+    for lang, pipeline in _kokoro_pipelines.items():
+        voice = _KOKORO_VOICE_MAP.get(lang, KOKORO_VOICE)
+        list(pipeline("Test.", voice=voice, speed=1.0))
+    print(f"[TTS] Kokoro (PyTorch) prêt en {time.time() - t0:.1f}s")
+
+
+import re
+import time
+import pathlib
+
+# Seuil relevé : Kokoro gère bien des textes plus longs en un seul appel,
+# ce qui évite le coût fixe (phonémisation espeak + lancement CUDA) de chaque appel.
+SEUIL_DECOUPAGE = 300
+
+# Taille cible d'un segment après regroupement (évite trop de tout petits appels
+# même quand le texte doit être découpé sur . ! ?)
+TAILLE_SEGMENT_CIBLE = 250
+
+
+def _decouper_phrases(text: str) -> list[str]:
+    """Découpe uniquement sur la ponctuation forte (. ! ?), jamais sur la virgule.
+    Les virgules n'ont pas besoin d'être des points de coupe : Kokoro gère
+    très bien les pauses internes d'une phrase."""
+    return [p.strip() for p in re.split(r'(?<=[.!?])\s+', text) if p.strip()]
+
+
+def _regrouper_segments(parts: list[str], taille_max: int = TAILLE_SEGMENT_CIBLE) -> list[str]:
+    """Regroupe des phrases courtes ensemble pour minimiser le nombre d'appels
+    à pipeline(), tout en respectant une taille max par appel."""
+    groupes: list[str] = []
+    courant = ""
+    for p in parts:
+        candidat = f"{courant} {p}".strip() if courant else p
+        if len(candidat) <= taille_max:
+            courant = candidat
+        else:
+            if courant:
+                groupes.append(courant)
+            courant = p
+    if courant:
+        groupes.append(courant)
+    return groupes
+
+
+def text_to_speech(text: str, speed: float = KOKORO_SPEED, max_chars: int | None = None,
+                    cache_key: str | None = None, langue: str | None = None) -> str:
+    if not _kokoro_pipelines:
+        raise RuntimeError("Kokoro non initialisé")
+
+    # 1. Nettoyage et normalisation immédiate du texte
+    text = " ".join(text.split()).strip()
+    if not text:
+        raise ValueError("Texte vide")
+
+    # Troncature optionnelle si demandée (paramètre existant, désormais utilisé)
+    if max_chars is not None and len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+
+    # 2. Gestion rapide du cache
+    key = cache_key or _audio_cache_key(text)
+    cached = _get_cached_audio(key)
+    if cached:
+        return cached
+
+    # 3. Résolution des paramètres du modèle
+    lang = _resolve_lang(langue)
+    voice = _KOKORO_VOICE_MAP.get(lang, KOKORO_VOICE)
+    pipeline = _kokoro_pipelines.get(lang)
+    if pipeline is None:
+        raise RuntimeError(f"Kokoro non initialisé pour la langue : {lang}")
+    t0 = time.time()
+
+    print(f"[TTS] Génération {len(text)} chars, voice={voice}, lang={lang}, speed={speed}")
+
+    # 4. Synthèse adaptative (Directe vs Découpée + regroupée)
+    if len(text) <= SEUIL_DECOUPAGE:
+        segments = [text]
+    else:
+        phrases = _decouper_phrases(text)
+        segments = _regrouper_segments(phrases, TAILLE_SEGMENT_CIBLE)
+
+    all_s, sample_rate = [], 24000  # sample rate fixe pour kokoro (PyTorch)
+    for seg in segments:
+        t_seg = time.time()
+        chunks = [
+            audio.detach().cpu().numpy() if hasattr(audio, "detach") else audio
+            for _graphemes, _phonemes, audio in pipeline(seg, voice=voice, speed=speed)
+        ]
+        s = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        all_s.append(s)
+        # Log de debug par segment — utile pour repérer un segment anormalement lent.
+        # Commentez cette ligne si le volume de logs devient trop important en prod.
+        print(f"[TTS-seg] {len(seg)} chars en {time.time() - t_seg:.3f}s : {seg[:50]!r}")
+
+    samples = np.concatenate(all_s) if len(all_s) > 1 else all_s[0]
+
+    # 5. Conversion et écriture directe du fichier
+    audio_np = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    wav_path = str(pathlib.Path(AUDIO_CACHE_DIR) / f"tts_{key}.wav")
+    _wav.write(wav_path, sample_rate, audio_np)
+    _set_cached_audio(key, wav_path)
+
+    print(f"[TTS] {len(text)} chars générés en {time.time() - t0:.2f}s "
+          f"({len(segments)} segment(s)) {voice} {lang}")
+    return wav_path
+
+def _tts_safe(text: str, max_chars: int | None = None, cache_key: str | None = None, langue:str=None) -> str | None:
+    """TTS sans exception — retourne None si Kokoro non chargé."""
+    if not kokoro_ready():
+        print("[TTS] Kokoro non chargé — fallback silencieux")
+        return None
+    try:
+        return text_to_speech(text, max_chars=max_chars, cache_key=cache_key, langue=langue)
+    except Exception as exc:
+        print(f"[TTS] Erreur : {exc}")
+        return None
+
+
+# ── STT — Faster-Whisper ──────────────────────────────────────────────────────
+
+_WHISPER_INITIAL_PROMPT = (
+    "Visiteur dans un musée pose une question en français sur les œuvres d'art, "
+    "les artistes, les expositions et les salles. "
+    "Exemples : Quel tableau est exposé ici ? Qui a peint cette œuvre ? "
+    "Parlez-moi de cette sculpture. Qu'est-ce que cette exposition présente ? "
+    "Quel artiste a créé ce portrait ?"
+)
+
+_HALLUCINATION_PATTERNS = [
+    "sous-titres", "sous titres", "subtitles", "transcribed by",
+    "www.", "http", "merci d'avoir", "thanks for watching",
+    "[musique]", "[music]", "[applaudissements]", "abonnez-vous", "likez",
+]
+
+
+def _load_whisper() -> None:
+    global _whisper_model
+    from faster_whisper import WhisperModel
+    print(f"[STT] Chargement faster-whisper {WHISPER_MODEL} ({WHISPER_COMPUTE})...")
+    t0 = time.time()
+    _whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE,
+                                  compute_type=WHISPER_COMPUTE, cpu_threads=4, num_workers=1, )
+    # Warmup
+    silence = np.zeros(16000, dtype=np.int16)
+    buf = io.BytesIO()
+    _wav.write(buf, 16000, silence)
+    list(_whisper_model.transcribe(buf, language="fr", beam_size=1)[0])
+    print(f"[STT] Faster-Whisper {WHISPER_MODEL} prêt en {time.time()-t0:.1f}s")
+
+
+def _clean_audio(audio_bytes: bytes) -> tuple[bool, bytes]:
+    """Nettoyage audio : filtre silence, normalise, high-pass 60Hz, rééchantillonne 16kHz."""
+    from scipy.signal import butter, sosfilt
+    try:
+        rate, data = _wav.read(io.BytesIO(audio_bytes))
+        if data.dtype == np.int16:   samples = data.astype(np.float32) / 32768.0
+        elif data.dtype == np.int32: samples = data.astype(np.float32) / 2147483648.0
+        else:                        samples = data.astype(np.float32)
+        if samples.ndim == 2:
+            samples = samples.mean(axis=1)
+
+        peak = float(np.max(np.abs(samples)))
+        print(f"[AUDIO] peak={peak:.5f} rate={rate}Hz dur={len(samples)/rate:.2f}s")
+
+        if peak < 0.0005:
+            print("[AUDIO] Silence absolu — skip STT")
+            return False, audio_bytes
+        if peak < 0.05:
+            samples = samples / peak * 0.7
+            print("[AUDIO] Normalisation appliquée")
+
+        sos     = butter(2, 60.0 / (rate / 2), btype="high", output="sos")
+        samples = sosfilt(sos, samples).astype(np.float32)
+
+        if rate != 16000:
+            from scipy.signal import resample_poly
+            g       = gcd(16000, rate)
+            samples = resample_poly(samples, 16000 // g, rate // g).astype(np.float32)
+            rate    = 16000
+
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        _wav.write(buf, rate, pcm)
+        cleaned = buf.getvalue()
+        print(f"[AUDIO] Nettoyé : {len(audio_bytes)} → {len(cleaned)} bytes | 16kHz mono")
+        return True, cleaned
+    except Exception as exc:
+        print(f"[AUDIO] Erreur ({exc}) — audio original utilisé")
+        return True, audio_bytes
+
+
+def _transcribe(audio_bytes: bytes, mime: str,langue:str = "fr") -> str:
+    import datetime
+    debug_dir = "/app/audio_debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    ext = "ogg" if "ogg" in mime else "webm" if "webm" in mime else "wav"
+
+    with open(f"{debug_dir}/vocal_{ts}_raw.{ext}", "wb") as f:
+        f.write(audio_bytes)
+    print(f"[STT] Raw : {len(audio_bytes)} bytes")
+
+    if "wav" in mime:
+        has_voice, audio_bytes = _clean_audio(audio_bytes)
+        with open(f"{debug_dir}/vocal_{ts}_clean.wav", "wb") as f:
+            f.write(audio_bytes)
+        if not has_voice:
+            return "[inaudible]"
+
+    if _whisper_model is None:
+        print("[STT] Whisper non chargé")
+        return "[inaudible]"
+
+    print(f"[STT] Transcription ({len(audio_bytes)} bytes)... en {langue}")
+    t0 = time.time()
+    segments, _ = _whisper_model.transcribe(
+        io.BytesIO(audio_bytes),
+        language=langue,
+        initial_prompt=_WHISPER_INITIAL_PROMPT,
+        beam_size=5, best_of=5,
+        vad_filter=True,
+        vad_parameters=dict(threshold=0.5, min_speech_duration_ms=250,
+                            min_silence_duration_ms=500, speech_pad_ms=300),
+        temperature=0.0,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.5,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+    )
+    result = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+    print(f"[PERF] Whisper : {(time.time()-t0)*1000:.0f}ms | {repr(result)}")
+
+    if not result:
+        return "[inaudible]"
+    if any(p in result.lower() for p in _HALLUCINATION_PATTERNS):
+        print(f"[STT] Hallucination filtrée : {repr(result[:60])}")
+        return "[inaudible]"
+    return result
+
+
+def _safe_header(s: str, n: int = 300) -> str:
+    if s is None:
+        return "-"
+    s = unicodedata.normalize("NFKD", str(s)[:n]).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r'[^\x20-\x7e]', ' ', s)
+    s = re.sub(r' +', ' ', s).strip()
+    return s or "-"
+
+def _load_embedding_model() -> None:
+    global EMBED_MODEL, _model
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Utilisation de l'appareil : {device}")
+
+    model_name = "intfloat/multilingual-e5-base"
+    print(f"Chargement du modèle {model_name}...")
+
+    EMBED_MODEL = model_name
+
+    if device == "cuda":
+        print(f"Modèle de GPU détecté : {torch.cuda.get_device_name(0)}")
+        # FP16 : économise ~50% de VRAM et accélère sur GPU (T4, etc.)
+        _model = SentenceTransformer(
+            model_name, device=device,
+            model_kwargs={"torch_dtype": torch.float16},
+        )
+    else:
+        # Sur CPU : rester en FP32 (le FP16 y est mal supporté et bien plus lent)
+        _model = SentenceTransformer(model_name, device=device)
+    print(f"Modèle d'embeddings {model_name} chargé avec succès sur {device}.")
+
+def _create_table_documents():
+    conn.rollback()
+    # Suppression sécurisée de la table
+    cur.execute("""
+    DROP TABLE IF EXISTS rag_documents;
+    """)
+    conn.commit() # Très important pour valider la suppression !
+    print("Ancienne table supprimée (si elle existait).")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rag_documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    content TEXT NOT NULL,
+
+    embedding VECTOR(768),
+
+    entity_id TEXT,
+
+    metadata JSONB DEFAULT '{}'::jsonb,
+
+    created_at TIMESTAMP DEFAULT now()
+    );
+    """)
+
+    conn.commit()
+    print("Table rag_documents créée avec succès.")
+# ── Initialisation ────────────────────────────────────────────────────────────
+
+def initialize() -> None:
+    global _model, _llm, _answer_cache, conn, cur, _conversation_histories
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    print("=== STEP 1 : chargement du modèle d'embeddings ===")
+    # _model = SentenceTransformer(EMBED_MODEL, device="cpu")
+    # _model.encode(["warmup"], normalize_embeddings=True)
+    _create_table_documents()
+    _model = SentenceTransformer(EMBED_MODEL, device='cuda')
+    #_load_embedding_model()
+    print(f"  Modèle {EMBED_MODEL} prêt.")
+
+    print("=== STEP 2 : construction des embeddings ===")
+    
+    build_embeddings()
+   
+
+    print("=== STEP 3 : configuration de Gemini ===")
+    if GEMINI_API_KEY:
+        _llm = genai.Client(api_key=GEMINI_API_KEY)
+        print(f"  Gemini : {GEMINI_MODEL}")
+    else:
+        print("WARN : GEMINI_API_KEY non définie.")
+
+    print("=== STEP 4 : cache réponses ===")
+    _answer_cache = TTLCache(maxsize=ANSWER_CACHE_SIZE, ttl=ANSWER_CACHE_TTL)
+    print(f"  Cache : {ANSWER_CACHE_SIZE} entrées / {ANSWER_CACHE_TTL}s TTL")
+
+    _conversation_histories = {}
+    print("  Historiques par visiteur : illimités (pas de TTL, dict en mémoire)")
+
+    print("=== STEP 5 : chargement Kokoro (PyTorch) ===")
+    try:
+        _load_kokoro()
+    except Exception as e:
+        print(f"  WARN Kokoro : {e}")
+
+    print("=== STEP 6 : chargement Faster-Whisper ===")
+    try:
+        _load_whisper()
+    except Exception as e:
+        print(f"  WARN Faster-Whisper : {e}")
+
+    print(f"=== READY : {len(_metadata)} documents indexés ===")
+
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initialize()
+    yield
+
+
+api = FastAPI(title="RAG — Galerie Virtuelle d'Art v2", lifespan=lifespan)
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["X-Question", "X-Answer-Text", "X-Detected-Lang", "X-Cache"],
+    max_age=3600,
+)
+
+
+# ── Schémas Pydantic ──────────────────────────────────────────────────────────
+
+class QueryRequest(BaseModel):
+    question:        str
+    top_k:           int = 3
+    salle_nom:       str | None = None
+    exposition_nom:  str | None = None
+    institution_nom: str | None = None
+    bien_titre:      str | None = None
+    langue:          str | None = None
+
+
+class TTSRequest(BaseModel):
+    text:  str
+    speed: float = 1.0
+
+
+class ExplainRequest(BaseModel):
+    bien_titre:      str
+    salle_nom:       str | None = None
+    exposition_nom:  str | None = None
+    institution_nom: str | None = None
+    top_k:           int = 5
+    langue:          str = "fr"
+
+
+
+
+def _reload_bg() -> None:
+    """Lance un rebuild complet en arrière-plan (pour resynchroniser avec les microservices)."""
+    threading.Thread(target=build_embeddings, daemon=True).start()
+
+
+# ── Fonctions d'ajout métier ──────────────────────────────────────────────────
+# Reçoivent le dict brut du microservice, reconstituent les index depuis _metadata,
+# appellent les build_text_* et injectent le résultat dans l'index.
+
+def _live_raws(type_filter: str | None = None) -> list[dict]:
+    """Retourne les dicts bruts stockés dans _metadata, filtrés par type si fourni."""
+    return [m["_raw"] for m in _metadata if "_raw" in m
+            and (type_filter is None or m.get("type") == type_filter
+                 or (type_filter == "bien" and m.get("type", "").startswith("bien_")))]
+
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "documents": len(_metadata),
+            "cache_age_seconds": int(time.time() - _cache_built_at), "cache_ttl_seconds": CACHE_TTL}
+
+
+@api.post("/query")
+def query(req: QueryRequest):
+    logger.info(f"langue {req.langue}")
+    results = search_documents(req.question, req.top_k)
+    print(f"[QUERY] {req.question} → {len(results)} résultats")
+    answer  = generate_answer(req.question, results, req.salle_nom, req.exposition_nom, req.institution_nom, req.langue, bien_titre=req.bien_titre)
+    print(f"[QUERY_REPONSE] Réponse : {answer[:100]}...")
+    formatted_sources = []
+    for r in results:
+        if isinstance(r, dict):
+            formatted_sources.append({
+                "type": r.get("type", "inconnu"),
+                "titre": r.get("titre", "Document"),
+                "score": round(r.get("score", 0.0), 4)
+            })
+        elif isinstance(r, (tuple, list)) and len(r) >= 2:
+            # Si c'est un tuple brut (ex: retour direct de psql sans mapping)
+            # On considère par défaut : r[0] = contenu, r[1] = metadata (JSON ou dict)
+            meta = r[1] if isinstance(r[1], dict) else {}
+            formatted_sources.append({
+                "type": meta.get("type", "inconnu"),
+                "titre": str(meta.get("type", "Document")).capitalize(),
+                "score": 0.0  # Par défaut si la distance n'est pas extraite du tuple
+            })
+
+    return {
+        "answer": answer,
+        "sources": formatted_sources
+    }
+
+
+@api.post("/vapi/webhook")
+async def vapi_webhook(request: Request):
+    body      = await request.json()
+    calls     = body.get("message", {}).get("toolCalls", [])
+    if not calls:
+        raise HTTPException(status_code=400, detail="Aucun tool call")
+    call    = calls[0]
+    args    = call.get("function", {}).get("arguments", {})
+    if isinstance(args, str):
+        args = json.loads(args)
+    question = args.get("question", "")
+    results  = search_documents(question, top_k=5)
+    answer   = generate_answer(question, results)
+    return {"results": [{"toolCallId": call.get("id"), "result": answer}]}
+
+
+@api.post("/rag/reload")
+def rag_reload():
+    build_embeddings()
+    return {"status": "rebuilt", "documents": len(_metadata)}
+
+
+@api.post("/stt")
+async def stt(audio: UploadFile = File(...)):
+    if not _llm:
+        raise HTTPException(status_code=503, detail="Gemini non configuré.")
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Fichier audio vide.")
+    try:
+        return {"transcription": _transcribe(audio_bytes, audio.content_type or "audio/wav")}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur STT : {exc}")
+
+@api.post("/build_question")
+async def build_questions(request: Request,
+    salle_nom: str | None = None,
+    exposition_nom: str | None = None,
+    institution_nom: str | None = None,
+    bien_titre: str | None = None,
+    langue: str | None = None,
+    guest_id: str | None = None):
+    """Construit 5 questions de suivi (au format JSON), ancrées sur les documents
+    RAG pertinents pour tout le contexte disponible (salle, exposition, institution,
+    bien en focus, et dernier échange du visiteur)."""
+    guest_id = guest_id or request.cookies.get("guest_id")
+    lang     = _resolve_lang(langue)
+    print(f"[BUILD-QUESTION] salle={salle_nom} expo={exposition_nom} institution={institution_nom} bien={bien_titre} langue={langue} guest_id={guest_id}")
+
+    hist = _get_history(guest_id, salle_nom, exposition_nom, bien_titre)
+    derniere_question, derniere_reponse = (None, None)
+    if hist:
+        derniere_question, derniere_reponse = hist[-1]
+
+    # Requête utilisée pour retrouver les documents pertinents : on combine tout
+    # le contexte de localisation disponible (salle, exposition, institution,
+    # bien en focus) plutôt que de n'en garder qu'un seul, pour que la recherche
+    # documentaire reflète bien tout ce que l'on sait du visiteur. La dernière
+    # question posée est ajoutée en plus si elle existe, pour affiner davantage.
+    contexte_parts = []
+
+    if salle_nom:
+        contexte_parts.append(f"Salle : {salle_nom}")
+
+    if exposition_nom:
+        contexte_parts.append(f"Exposition : {exposition_nom}")
+
+    if institution_nom:
+        contexte_parts.append(f"Institution : {institution_nom}")
+
+    if bien_titre:
+        contexte_parts.append(f"Bien culturel ou objet : {bien_titre}")
+
+    if derniere_question:
+        contexte_parts.append(f"Question : {derniere_question}")
+
+    requete_docs = " ".join(contexte_parts) if contexte_parts else None
+
+    logger.info(f"[CREATE_QUESTIONS] {requete_docs}")
+
+    if requete_docs:
+        resultats = search_documents(requete_docs, top_k=5)
+        documents = [r.get("contenu", "") for r in resultats]
+    else:
+        # Aucun repère du tout (premier contact, aucune localisation) :
+        # on prend un échantillon des documents disponibles en base.
+        documents = get_rag_documents()[:5]
+
+    questions = generate_suggested_questions(derniere_question, derniere_reponse, lang, documents=documents)
+    return {"questions": questions}
+
+
+@api.post("/stt-query-tts")
+async def stt_query_tts(
+    request: Request,
+    audio: Annotated[UploadFile | None, File()] = None,
+    top_k: int = 4,
+    question_textuel:str | None =None,
+    salle_nom: str | None = None,
+    exposition_nom: str | None = None,
+    institution_nom: str | None = None,
+    bien_titre: str | None = None,
+    langue: str | None = None,
+    guest_id: str | None = None,
+):
+    # Priorité au paramètre explicite (envoyé par Unity) ; repli sur un cookie
+    # si jamais un autre client (ex: app web) en envoie un à la place.
+    guest_id = guest_id or request.cookies.get("guest_id")
+    print(f"[Guest Id] {guest_id}")
+    print(f"[STT-QUERY-TTS] salle={salle_nom} expo={exposition_nom} institution={institution_nom} bien={bien_titre} top_k={top_k} langue={langue} guest_id={guest_id}")
+    lang        = _resolve_lang(langue)
+    question=None
+    if question_textuel==None:
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Fichier audio vide.")
+
+        def _wav_response(text: str, question: str = "-", langue:str=None) -> FileResponse:
+            wav = _tts_safe(text,langue=langue)
+            if wav is None:
+                raise HTTPException(status_code=503, detail="TTS non disponible.")
+            return FileResponse(wav, media_type="audio/wav", filename="response.wav",
+                            headers={"X-Question": question, "X-Answer-Text": _safe_header(text),
+                                     "Access-Control-Expose-Headers": "X-Question, X-Answer-Text"})
+
+        if not salle_nom and not exposition_nom and not institution_nom:
+            return _wav_response("Vous n'etes pas encore dans une salle d'exposition. Veuillez vous deplacer vers une salle.")
+        print(f"[STT-QUERY-TTS] Transcription audio ({len(audio_bytes)} bytes)...")
+    
+        try:
+            question = _transcribe(audio_bytes, audio.content_type or "audio/wav",langue=langue)
+        
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Erreur STT : {exc}")
+
+        if not question or question.strip().lower() in {"", "[inaudible]", "[silence]"} or len(question.strip()) < 3:
+                return _wav_response("Je n'ai pas entendu votre question. Pouvez-vous repeter ?",langue=langue)
+    else:
+            question=question_textuel
+
+    if bien_titre:
+                question = f"{question} (Focus toi sur ce bien culturel : {bien_titre})"
+
+   
+
+    t0 = time.time(); results = search_documents(question, top_k)
+    print(f"[PERF] RAG    : {(time.time()-t0)*1000:.0f}ms")
+    t0 = time.time(); answer = generate_answer(question, results, salle_nom, exposition_nom, institution_nom, lang, guest_id=guest_id, bien_titre=bien_titre)
+    print(f"[PERF] Gemini : {(time.time()-t0)*1000:.0f}ms")
+    t0 = time.time(); wav_path = text_to_speech(answer, langue=lang)
+    print(f"[PERF] TTS    : {(time.time()-t0)*1000:.0f}ms {langue} {lang} {exposition_nom} {institution_nom} {answer}")
+
+    return FileResponse(wav_path, media_type="audio/wav", filename="response.wav",
+                        headers={"X-Question": _safe_header(question, 200),
+                                 "X-Answer-Text": _safe_header(answer, 500),
+                                 "Access-Control-Expose-Headers": "X-Question, X-Answer-Text"})
+
+
+@api.post("/tts")
+def tts(req: TTSRequest):
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Champ 'text' vide.")
+    if not kokoro_ready():
+        raise HTTPException(status_code=503, detail="Kokoro non encore chargé.")
+    try:
+        return FileResponse(text_to_speech(req.text, req.speed),
+                            media_type="audio/wav", filename="tts.wav")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur TTS : {exc}")
+
+
+@api.get("/text_rag")
+async def text_rag():
+    """Retourne le contenu texte brut de tous les documents indexés dans rag_documents."""
+    if cur is None:
+        raise HTTPException(status_code=503, detail="Base de données non connectée.")
+    try:
+        documents = get_rag_documents()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur RAG : {exc}")
+
+    return {
+        "count": len(documents),
+        "documents": documents,
+    }
+
+
+@api.post("/explain")
+async def explain(req: ExplainRequest):
+    if not req.bien_titre or not req.bien_titre.strip():
+        raise HTTPException(status_code=400, detail="Champ 'bien_titre' vide.")
+    if not _llm:
+        raise HTTPException(status_code=503, detail="Gemini non configuré.")
+    if not kokoro_ready():
+        raise HTTPException(status_code=503, detail="Kokoro non chargé.")
+    print(f"langue {req.langue}")
+    question = f"Explique le bien culturel : {req.bien_titre}"
+    results  = search_documents(question, req.top_k)
+
+    location_parts = []
+    """
+    if req.salle_nom:       location_parts.append(f"Salle : {req.salle_nom}")
+    if req.exposition_nom:  location_parts.append(f"Exposition : {req.exposition_nom}")
+    if req.institution_nom: location_parts.append(f"Institution : {req.institution_nom}")
+    if req.langue:          location_parts.append(f"Langue : {req.langue}")
+    """
+    location_block = ("Contexte de visite :\n" + "\n".join(location_parts) + "\n\n") if location_parts else ""
+
+    context = "\n\n---\n\n".join(
+        f"[{r.get('type','').upper()}] {r['titre']}\n{r['contenu']}" for r in results
+    ) if results else "Aucun document disponible pour ce bien."
+
+    prompt = (
+        f"{EXPLAIN_SYSTEM_PROMPT}\n\n{location_block}Contexte RAG :\n{context}\n\n"
+        f"Réponds avec la langue {req.langue}. "
+        f"Le visiteur se trouve devant le bien culturel intitulé : \"{req.bien_titre}\"\n"
+        f"Donne une explication naturelle et engageante en t'appuyant sur sa description, "
+        f"son historique, sa technique et son sujet en 3 phrases."
+    )
+    
+    explain_key = f"expl_{_audio_cache_key(req.bien_titre + str(req.salle_nom) + str(req.exposition_nom) + str(req.institution_nom) + str(req.langue))}"
+
+    # Cache audio complet
+    cached_wav = _get_cached_audio(explain_key)
+    if cached_wav:
+        cached_txt = _answer_cache.get(explain_key, "-") if _answer_cache else "-"
+        return FileResponse(cached_wav, media_type="audio/wav", filename="explain.wav",
+                            headers={"X-Answer-Text": _safe_header(cached_txt, 500), "X-Cache": "HIT",
+                                     "Access-Control-Expose-Headers": "X-Answer-Text, X-Cache"})
+
+    # Cache texte Gemini
+    answer = _answer_cache.get(explain_key) if _answer_cache else None
+    if answer is None:
+        try:
+            t0     = time.time()
+            answer = response = _llm.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=500,
+                thinking_config=types.ThinkingConfig(
+                 thinking_budget=4
+                ),
+             ),
+            ).text
+            print(f"[EXPLAIN] Gemini : {(time.time()-t0)*1000:.0f}ms | {len(answer)} chars")
+            if _answer_cache is not None:
+                _answer_cache[explain_key] = answer
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Erreur Gemini : {exc}")
+
+    try:
+        t0       = time.time()
+        wav_path = text_to_speech(answer, max_chars=None, cache_key=explain_key, langue=req.langue)
+        print(f"[EXPLAIN] TTS : {(time.time()-t0)*1000:.0f}ms {req.langue}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur TTS : {exc}")
+
+    return FileResponse(wav_path, media_type="audio/wav", filename="explain.wav",
+                        headers={"X-Answer-Text": _safe_header(answer, 500), "X-Cache": "MISS",
+                                 "Access-Control-Expose-Headers": "X-Answer-Text, X-Cache"})
+
+
+@api.post("/cache/clear")
+async def cache_clear(audio: bool = True, textes: bool = True):
+    rapport = {}
+    if audio:
+        d = pathlib.Path(AUDIO_CACHE_DIR)
+        nb, taille = 0, 0.0
+        if d.exists():
+            for f in d.glob("tts_*.wav"):
+                taille += f.stat().st_size / 1024 / 1024
+                f.unlink()
+                nb += 1
+        _audio_cache.clear()
+        rapport["audio"] = {"status": "nettoyé", "fichiers": nb, "mb": round(taille, 2)}
+    if textes:
+        nb = len(_answer_cache) if _answer_cache else 0
+        if _answer_cache:
+            _answer_cache.clear()
+        rapport["textes"] = {"status": "nettoyé", "entrees": nb}
+    return {"status": "ok", "rapport": rapport}
+
+
+@api.get("/cache/stats")
+async def cache_stats():
+    d    = pathlib.Path(AUDIO_CACHE_DIR)
+    wavs = list(d.glob("tts_*.wav")) if d.exists() else []
+    mb   = sum(f.stat().st_size for f in wavs) / 1024 / 1024
+    return {
+        "cache_audio": {"fichiers": len(wavs), "mb": round(mb, 2), "ttl_h": AUDIO_CACHE_TTL // 3600},
+        "cache_texte": {"entrees": len(_answer_cache) if _answer_cache else 0},
+    }
+
+
+# Route de vérification de l'état du serveur
+@api.get("/")
+def health_check():
+    return {"status": "healthy"}
+
+# ── Fonctions update_* ────────────────────────────────────────────────────────
+# Le titre/nom dans le payload EST l'identifiant pour retrouver le document.

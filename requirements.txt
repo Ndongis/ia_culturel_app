@@ -1,0 +1,22 @@
+# API
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+# Embeddings + RAG
+sentence-transformers
+faiss-cpu
+numpy
+scipy
+# LLM
+google-genai
+
+# STT
+faster-whisper
+kokoro
+
+# HTTP + Cache
+httpx
+cachetools
+psycopg2-binary
