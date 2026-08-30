@@ -877,6 +877,7 @@ def _build_prompt(question: str, results: list,
                   institution_nom: str | None = None, langue: str = None,
                   guest_id: str | None = None, bien_titre: str | None = None) -> str:
     location_parts = []
+    print(f"[RESULTATS] {results}")
     if salle_nom:        location_parts.append(f"Salle actuelle : {salle_nom}")
     if exposition_nom:   location_parts.append(f"Exposition en cours : {exposition_nom}")
     if institution_nom:  location_parts.append(f"Institution : {institution_nom}")
