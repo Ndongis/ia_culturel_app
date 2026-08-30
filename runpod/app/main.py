@@ -705,7 +705,7 @@ def search_documents(question: str, top_k: int = 4):
             if clean_text:
                 cleaned_docs.append(clean_text)
 
-        print(f"[CLEANED DOCS] {cleaned_docs}")
+       
         return cleaned_docs
 
     except Exception as exc:
@@ -888,7 +888,7 @@ def _build_prompt(question: str, results: list,
                   institution_nom: str | None = None, langue: str = None,
                   guest_id: str | None = None, bien_titre: str | None = None) -> str:
     location_parts = []
-    print(f"[RESULTATS] {results}")
+   # print(f"[RESULTATS] {results}")
     if salle_nom:        location_parts.append(f"Salle actuelle : {salle_nom}")
     if exposition_nom:   location_parts.append(f"Exposition en cours : {exposition_nom}")
     if institution_nom:  location_parts.append(f"Institution : {institution_nom}")
@@ -1711,6 +1711,7 @@ async def stt_query_tts(
 
     t0 = time.time(); results = search_documents(question, 20)
     print(f"[PERF] RAG    : {(time.time()-t0)*1000:.0f}ms")
+    print(f"[RESULTATS] {results}")
     t0 = time.time(); answer = generate_answer(question, results, salle_nom, exposition_nom, institution_nom, lang, guest_id=guest_id, bien_titre=bien_titre)
     print(f"[PERF] Gemini : {(time.time()-t0)*1000:.0f}ms")
     t0 = time.time(); wav_path = text_to_speech(answer, langue=lang)
