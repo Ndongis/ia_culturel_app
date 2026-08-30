@@ -1786,9 +1786,9 @@ async def explain(req: ExplainRequest):
                 contents=prompt,
                 config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=512,
+                max_output_tokens=1024,
                 thinking_config=types.ThinkingConfig(
-                 thinking_budget=4
+                 thinking_budget=512
                 ),
              ),
             ).text
