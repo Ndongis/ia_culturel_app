@@ -645,74 +645,44 @@ def embed_question(question):
 
 import json
 
-def search_documents(question: str, top_k: int = 4):
-    global cur, conn
-    question_embedding = embed_question(question)
+def search_documents(question: str, limit=15):
+    question_embedding=embed_question(question)
+    global cur
     
-    if cur is None:
-        return []
+    # 1. Requête SQL brute
+    cur.execute("""
+        SELECT content, metadata
+        FROM rag_documents
+        ORDER BY embedding <-> %s::vector
+        LIMIT %s;
+    """, (question_embedding, limit))
+    
+    results = cur.fetchall()  # Retourne une liste de tuples: [(content, metadata), ...]
 
-    try:
-        conn.rollback()
-        # 1. Requête PGVector
-        cur.execute("""
-            SELECT content, metadata, (embedding <-> %s::vector) AS distance
-            FROM rag_documents
-            ORDER BY embedding <-> %s::vector
-            LIMIT %s;
-        """, (question_embedding, question_embedding, top_k))
+    # 2. Nettoyage des résultats bruts
+    cleaned_results = []
+    for doc in results:
+        cleaned_doc = clean_rag_context(doc)
+        cleaned_results.append(cleaned_doc)
 
-        rows = cur.fetchall()
-        
-        results = []
-        for r in rows:
-            meta = r[1] if isinstance(r[1], dict) else json.loads(r[1] or '{}')
-            doc_type = meta.get("type", "document")
-            
-            # Nettoyage du texte du document uniquement
-            raw_content = r[0] or ""
-            cleaned_content = clean_rag_context(raw_content)
-            
-            # On conserve une structure de DICTIONNAIRE propre
-            results.append({
-                "content": cleaned_content,  # ou "contenu"
-                "page_content": cleaned_content, # pour compatibilité avec prepare_docs_for_reranking
-                "metadata": meta,
-                "type": doc_type,
-                "titre": meta.get("nom", meta.get("titre", doc_type.capitalize())),
-                "score": float(r[2]) if len(r) > 2 else 0.0
-            })
+    results = cleaned_results
 
-        # 2. Préparation pour Reranking (prend les dictionnaires en entrée)
-        docs_for_rerank = prepare_docs_for_reranking(results)
+    # 3. Préparation pour Reranking
+    docs = prepare_docs_for_reranking(results)
 
-        # 3. Reranking
-        reranked_docs = rerank_documents(question, docs_for_rerank, top_k=top_k)
-        print(f"Nombre de docs reranked : {len(reranked_docs)}")
+    # 4. Reranking (Top 5)
+    reranked_docs = rerank_documents(question, docs, 5)
+    print(reranked_docs)
 
-        # 4. Extraction et nettoyage final du contenu textuel
-        cleaned_docs = []
-        for doc in reranked_docs:
-            # Si rerank_documents renvoie des chaînes de caractères :
-            if isinstance(doc, str):
-                clean_text = remove_delimiters(doc)
-            # Si rerank_documents renvoie des dictionnaires :
-            elif isinstance(doc, dict):
-                clean_text = remove_delimiters(doc.get("content", doc.get("page_content", "")))
-            else:
-                clean_text = str(doc)
+    # 5. Restructuration en dictionnaires avec la clé "contenu"
+    # Cela permet d'éviter l'erreur 'str' object has no attribute 'get'
+    formatted_results = []
+    for doc in reranked_docs:
+        # Si rerank_documents renvoie une chaîne de caractères
+        text = doc if isinstance(doc, str) else str(doc)
+        formatted_results.append({"contenu": text})
 
-            if clean_text:
-                cleaned_docs.append(clean_text)
-
-       
-        return cleaned_docs
-
-    except Exception as exc:
-        print(f"❌ Erreur pgvector : {exc}")
-        if conn:
-            conn.rollback()
-        return []
+    return formatted_results
 
 # 1. On reformate les résultats bruts SQL en une LISTE de textes
 def prepare_docs_for_reranking(results):
