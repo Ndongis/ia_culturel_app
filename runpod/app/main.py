@@ -962,7 +962,7 @@ def generate_answer(question: str, results: list,
         temperature=0.2,
         max_output_tokens=800,
         thinking_config=types.ThinkingConfig(
-            thinking_budget=500
+            thinking_budget=512
             ),
         ),
         )
@@ -1025,7 +1025,7 @@ def generate_suggested_questions(question: str | None = None, answer: str | None
             config=types.GenerateContentConfig(
                 temperature=0.4,
                 max_output_tokens=2000,
-                thinking_config=types.ThinkingConfig(thinking_budget=1500),
+                thinking_config=types.ThinkingConfig(thinking_budget=1000),
                 response_mime_type="application/json",
             ),
         )
@@ -1788,7 +1788,7 @@ async def explain(req: ExplainRequest):
                 contents=prompt,
                 config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=500,
+                max_output_tokens=512,
                 thinking_config=types.ThinkingConfig(
                  thinking_budget=4
                 ),
