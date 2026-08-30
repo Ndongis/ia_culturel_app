@@ -645,7 +645,7 @@ def embed_question(question):
 
 import json
 
-def search_documents(question: str, limit=15):
+def search_documents(question: str, limit=15, top_k=5):
     question_embedding=embed_question(question)
     global cur
     
@@ -671,7 +671,7 @@ def search_documents(question: str, limit=15):
     docs = prepare_docs_for_reranking(results)
 
     # 4. Reranking (Top 5)
-    reranked_docs = rerank_documents(question, docs, 5)
+    reranked_docs = rerank_documents(question, docs, top_k)
     print(reranked_docs)
 
     # 5. Restructuration en dictionnaires avec la clé "contenu"
@@ -779,27 +779,36 @@ def remove_delimiters(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
 
+import ast
 def clean_rag_context(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
 
-    # 1. Supprimer le bloc "CONTEXTE GLOBAL..." initial jusqu'au premier "---"
-    text = re.sub(r"CONTEXTE GLOBAL DE LA BASE DE DONNÉES :[\s\S]*?---\n?", "", text)
+    # 1. Extraction si le texte est un tuple littéral Python : ("contenu...", {'id': ...})
+    text = text.strip()
+    if text.startswith('("') or text.startswith("('"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, tuple) and len(parsed) > 0:
+                text = str(parsed[0])
+        except Exception:
+            text = re.sub(r'^\("|\', \{.*\}\)$', '', text)
 
-    # 2. Supprimer les métadonnées (METADATA:\n{...} ou METADATA: {...})
+    # 2. Supprimer les mots parasites "DOCUMENT:" et le bloc "METADATA: {...}"
+    text = re.sub(r"DOCUMENT:\s*", "", text)
     text = re.sub(r"METADATA:\s*\{[\s\S]*?\}", "", text)
+    text = re.sub(r"METADATA:", "", text)
 
-    # 3. Supprimer toutes les lignes de tirets (ex: -------------------- ou ---)
-    text = re.sub(r"-{3,}", "", text)
+    # 3. Dé-échapper les caractères spéciaux (\n -> saut de ligne, \' -> ')
+    text = text.replace("\\n", "\n").replace("\\'", "'")
 
-    # 4. Supprimer les instructions système et balises RAG
-    text = re.sub(r"Vous êtes un guide expert en musée", "", text)
-    text = re.sub(r"DOCUMENT:", "", text)
-    text = re.sub(r"Contexte:\s*", "", text)
-    text = re.sub(r"c'est un bien culturel qui appartient à une institution", "", text)
-    text = re.sub(r"C'est un artiste associé à des biens culturels", "", text)
+    # 4. Nettoyer les ponctuations parasites (guillemets, crochets, accolades) tout en gardant les points
+    text = re.sub(r'[\"{}\[\]\(\)]', '', text)
 
-    # 5. Reconstruire un texte propre ligne par ligne (supprime les espaces et lignes vides)
+    # 5. Supprimer les tirets et lignes de séparation
+    text = re.sub(r"-{2,}", "", text)
+
+    # 6. Reconstruire un texte propre ligne par ligne
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
 
