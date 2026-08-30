@@ -47,7 +47,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from math import gcd
 import logging
-
+from sentence_transformers import CrossEncoder
 # Récupérer le logger d'uvicorn
 logger = logging.getLogger("uvicorn.error")
 
@@ -192,6 +192,7 @@ _audio_cache:    dict                  = {}
 _kokoro_pipelines: dict                = {}
 _whisper_model                         = None
 data = None
+reranker=None
 
 # ── Helpers langue ────────────────────────────────────────────────────────────
 
@@ -345,7 +346,7 @@ def insert_biens(biens):
                 "type": "bien",
                 "id": bien.get("id"),
                 "institution_id": bien.get("institution_id"),
-                "artiste_UNCTIONSid": bien.get("artiste_id"),
+                "artiste_id": bien.get("artiste_id"),
             })
         )),
 
@@ -641,6 +642,7 @@ def build_embeddings() -> None:
 def embed_question(question):
     return _model.encode(question).tolist()
 
+
 def search_documents(question: str, top_k: int = 4):
     global cur, conn
     question_embedding = embed_question(question)
@@ -675,7 +677,24 @@ def search_documents(question: str, top_k: int = 4):
                 "score": float(r[2]) if len(r) > 2 else 0.0  # Récupération de la distance SQL
             })
 
-        return results
+        # Nettoyage des résultats
+        cleaned_results = [clean_rag_context(doc) for doc in results]
+
+        # 3. Préparation pour Reranking
+        docs = prepare_docs_for_reranking(cleaned_results)
+
+        # 4. Reranking
+        reranked_docs = rerank_documents(question, docs, top_k=top_k)
+        print(f"Nombre de docs reranked : {len(reranked_docs)}")
+
+        # 5. Extraction et nettoyage du contenu textuel
+        cleaned_docs = []
+        for doc in reranked_docs:
+            clean_text = remove_delimiters(doc)
+            if clean_text:
+                cleaned_docs.append(clean_text)
+
+        return cleaned_docs
 
     except Exception as exc:
         print(f"❌ Erreur pgvector : {exc}")
@@ -684,6 +703,37 @@ def search_documents(question: str, top_k: int = 4):
         return []
 
 
+# 1. On reformate les résultats bruts SQL en une LISTE de textes
+def prepare_docs_for_reranking(results):
+    docs_list = []
+    for item in results:
+        # Cas 1 : Si item est un tuple/liste (ex: (content, metadata) ou (content, metadata, score))
+        if isinstance(item, (tuple, list)):
+            content = item[0]
+            metadata = item[1] if len(item) > 1 else {}
+
+        # Cas 2 : Si item est un dictionnaire
+        elif isinstance(item, dict):
+            content = item.get("content") or item.get("page_content") or str(item)
+            metadata = item.get("metadata", {})
+
+        # Cas 3 : Si item est un objet Document (ex: LangChain)
+        elif hasattr(item, "page_content"):
+            content = item.page_content
+            metadata = getattr(item, "metadata", {})
+
+        # Cas 4 : Chaîne de caractères brute
+        else:
+            content = str(item)
+            metadata = {}
+
+        # Nettoyage optionnel du texte si clean_rag_context est utilisé
+        cleaned_content = clean_rag_context(content)
+
+        doc_str = f"DOCUMENT:\n{cleaned_content}\n\nMETADATA:\n{metadata}"
+        docs_list.append(doc_str)
+
+    return docs_list
 
 def get_rag_documents() -> list[str]:
     """Récupère le contenu texte (`content`) de tous les documents RAG,
@@ -704,7 +754,73 @@ def get_rag_documents() -> list[str]:
         if conn:
             conn.rollback()
         return []
+def rerank_documents(query: str, retrieved_docs: list, top_k: int = 5) -> list:
+    if not retrieved_docs:
+        return []
 
+    # SÉCURITÉ : Si l'utilisateur passe une str au lieu d'une list
+    if isinstance(retrieved_docs, str):
+        retrieved_docs = [retrieved_docs]
+
+    # Extraction des textes si la liste contient des tuples ou dicts
+    doc_texts = []
+    for doc in retrieved_docs:
+        if isinstance(doc, (tuple, list)):
+            doc_texts.append(doc[0])
+        elif isinstance(doc, dict):
+            doc_texts.append(doc.get("content", str(doc)))
+        else:
+            doc_texts.append(str(doc))
+
+    # Préparation des paires (Query, Passage)
+    pairs = [[query, text] for text in doc_texts]
+
+    # Calcul des scores
+    scores = reranker.predict(pairs)
+
+    # Tri décroissant selon les scores de pertinence
+    scored_docs = list(zip(scores, doc_texts))
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+    return [doc_text for score, doc_text in scored_docs[:top_k]]
+
+import re
+
+def remove_delimiters(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+
+    # Supprime toutes les variantes de lignes de tirets
+    text = text.replace("--------------------", "")
+    text = text.replace("---", "")
+
+    # Reconstruit le texte en supprimant les lignes vides inutiles
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)
+
+def clean_rag_context(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 1. Supprimer le bloc "CONTEXTE GLOBAL..." initial jusqu'au premier "---"
+    text = re.sub(r"CONTEXTE GLOBAL DE LA BASE DE DONNÉES :[\s\S]*?---\n?", "", text)
+
+    # 2. Supprimer les métadonnées (METADATA:\n{...} ou METADATA: {...})
+    text = re.sub(r"METADATA:\s*\{[\s\S]*?\}", "", text)
+
+    # 3. Supprimer toutes les lignes de tirets (ex: -------------------- ou ---)
+    text = re.sub(r"-{3,}", "", text)
+
+    # 4. Supprimer les instructions système et balises RAG
+    text = re.sub(r"Vous êtes un guide expert en musée", "", text)
+    text = re.sub(r"DOCUMENT:", "", text)
+    text = re.sub(r"Contexte:\s*", "", text)
+    text = re.sub(r"c'est un bien culturel qui appartient à une institution", "", text)
+    text = re.sub(r"C'est un artiste associé à des biens culturels", "", text)
+
+    # 5. Reconstruire un texte propre ligne par ligne (supprime les espaces et lignes vides)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)
 
 # ── Génération de réponse ─────────────────────────────────────────────────────
 
@@ -1278,7 +1394,7 @@ def _create_table_documents():
 # ── Initialisation ────────────────────────────────────────────────────────────
 
 def initialize() -> None:
-    global _model, _llm, _answer_cache, conn, cur, _conversation_histories
+    global _model, _llm, _answer_cache, conn, cur, _conversation_histories, reranker
 
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -1323,6 +1439,12 @@ def initialize() -> None:
         print(f"  WARN Faster-Whisper : {e}")
 
     print(f"=== READY : {len(_metadata)} documents indexés ===")
+
+
+    print("=== STEP 7 : chargement Faster-Whisper ===")
+
+    # Utilisation du modèle multilingue adapté au français
+    reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512, device='cuda')
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
