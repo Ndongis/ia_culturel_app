@@ -693,7 +693,7 @@ def search_documents(question: str, top_k: int = 4):
             clean_text = remove_delimiters(doc)
             if clean_text:
                 cleaned_docs.append(clean_text)
-
+        print(f"[CLEANED DOCS] {cleaned_docs}")
         return cleaned_docs
 
     except Exception as exc:
