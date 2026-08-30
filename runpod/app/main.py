@@ -1678,8 +1678,12 @@ async def stt_query_tts(
                 question = f"{question} (Focus toi sur ce bien culturel : {bien_titre})"
 
    
-
-    t0 = time.time(); results = search_documents(question)
+    location_parts=[]
+    if salle_nom:       location_parts.append(f"Salle actuelle : {salle_nom} ")
+    if exposition_nom:  location_parts.append(f"Exposition en cours : {exposition_nom} ")
+    if institution_nom:  location_parts.append(f"Institution : {institution_nom} ")
+    if bien_titre:       location_parts.append(f"Bien culturel en focus : {bien_titre} ")
+    t0 = time.time(); results = search_documents(location_parts +" "+question)
     print(f"[PERF] RAG    : {(time.time()-t0)*1000:.0f}ms")
     print(f"[RESULTATS] {results}")
     t0 = time.time(); answer = generate_answer(question, results, salle_nom, exposition_nom, institution_nom, lang, guest_id=guest_id, bien_titre=bien_titre)
