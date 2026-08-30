@@ -1757,7 +1757,7 @@ async def explain(req: ExplainRequest):
     location_block = ("Contexte de visite :\n" + "\n".join(location_parts) + "\n\n") if location_parts else ""
 
     context = "\n\n---\n\n".join(
-        f"[{r.get('type','').upper()}] {r['titre']}\n{r['contenu']}" for r in results
+       results
     ) if results else "Aucun document disponible pour ce bien."
 
     prompt = (
