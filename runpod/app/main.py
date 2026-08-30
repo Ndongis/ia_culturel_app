@@ -643,6 +643,8 @@ def embed_question(question):
     return _model.encode(question).tolist()
 
 
+import json
+
 def search_documents(question: str, top_k: int = 4):
     global cur, conn
     question_embedding = embed_question(question)
@@ -652,7 +654,7 @@ def search_documents(question: str, top_k: int = 4):
 
     try:
         conn.rollback()
-        # 🌟 Correction : On sélectionne l'opérateur de distance dans le SELECT pour avoir le score
+        # 1. Requête PGVector
         cur.execute("""
             SELECT content, metadata, (embedding <-> %s::vector) AS distance
             FROM rag_documents
@@ -660,39 +662,49 @@ def search_documents(question: str, top_k: int = 4):
             LIMIT %s;
         """, (question_embedding, question_embedding, top_k))
 
-        rows = cur.fetchall()  # rows contient maintenant (content, metadata, distance)
+        rows = cur.fetchall()
         
         results = []
         for r in rows:
             meta = r[1] if isinstance(r[1], dict) else json.loads(r[1] or '{}')
-            
-            # 🌟 Calcul du titre dynamique basé sur les métadonnées de l'objet indexé
             doc_type = meta.get("type", "document")
             
+            # Nettoyage du texte du document uniquement
+            raw_content = r[0] or ""
+            cleaned_content = clean_rag_context(raw_content)
+            
+            # On conserve une structure de DICTIONNAIRE propre
             results.append({
-                "contenu": r[0],
+                "content": cleaned_content,  # ou "contenu"
+                "page_content": cleaned_content, # pour compatibilité avec prepare_docs_for_reranking
+                "metadata": meta,
                 "type": doc_type,
-                # On utilise le titre ou nom s'il est présent dans les métadonnées lors de l'indexation
                 "titre": meta.get("nom", meta.get("titre", doc_type.capitalize())),
-                "score": float(r[2]) if len(r) > 2 else 0.0  # Récupération de la distance SQL
+                "score": float(r[2]) if len(r) > 2 else 0.0
             })
 
-        # Nettoyage des résultats
-        cleaned_results = [clean_rag_context(doc) for doc in results]
+        # 2. Préparation pour Reranking (prend les dictionnaires en entrée)
+        docs_for_rerank = prepare_docs_for_reranking(results)
 
-        # 3. Préparation pour Reranking
-        docs = prepare_docs_for_reranking(cleaned_results)
-
-        # 4. Reranking
-        reranked_docs = rerank_documents(question, docs, top_k=top_k)
+        # 3. Reranking
+        reranked_docs = rerank_documents(question, docs_for_rerank, top_k=top_k)
         print(f"Nombre de docs reranked : {len(reranked_docs)}")
 
-        # 5. Extraction et nettoyage du contenu textuel
+        # 4. Extraction et nettoyage final du contenu textuel
         cleaned_docs = []
         for doc in reranked_docs:
-            clean_text = remove_delimiters(doc)
+            # Si rerank_documents renvoie des chaînes de caractères :
+            if isinstance(doc, str):
+                clean_text = remove_delimiters(doc)
+            # Si rerank_documents renvoie des dictionnaires :
+            elif isinstance(doc, dict):
+                clean_text = remove_delimiters(doc.get("content", doc.get("page_content", "")))
+            else:
+                clean_text = str(doc)
+
             if clean_text:
                 cleaned_docs.append(clean_text)
+
         print(f"[CLEANED DOCS] {cleaned_docs}")
         return cleaned_docs
 
@@ -701,7 +713,6 @@ def search_documents(question: str, top_k: int = 4):
         if conn:
             conn.rollback()
         return []
-
 
 # 1. On reformate les résultats bruts SQL en une LISTE de textes
 def prepare_docs_for_reranking(results):
@@ -1698,7 +1709,7 @@ async def stt_query_tts(
 
    
 
-    t0 = time.time(); results = search_documents(question, top_k)
+    t0 = time.time(); results = search_documents(question, 20)
     print(f"[PERF] RAG    : {(time.time()-t0)*1000:.0f}ms")
     t0 = time.time(); answer = generate_answer(question, results, salle_nom, exposition_nom, institution_nom, lang, guest_id=guest_id, bien_titre=bien_titre)
     print(f"[PERF] Gemini : {(time.time()-t0)*1000:.0f}ms")
