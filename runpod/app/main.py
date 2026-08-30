@@ -1755,7 +1755,7 @@ async def explain(req: ExplainRequest):
     if req.langue:          location_parts.append(f"Langue : {req.langue}")
     """
     location_block = ("Contexte de visite :\n" + "\n".join(location_parts) + "\n\n") if location_parts else ""
-
+    print(f"[RESULTATS] {results}")
     context = "\n\n---\n\n".join(
        results
     ) if results else "Aucun document disponible pour ce bien."
