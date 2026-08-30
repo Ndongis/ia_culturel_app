@@ -1506,7 +1506,7 @@ def health():
 @api.post("/query")
 def query(req: QueryRequest):
     logger.info(f"langue {req.langue}")
-    results = search_documents(req.question, req.top_k)
+    results = search_documents(req.question)
     print(f"[QUERY] {req.question} → {len(results)} résultats")
     answer  = generate_answer(req.question, results, req.salle_nom, req.exposition_nom, req.institution_nom, req.langue, bien_titre=req.bien_titre)
     print(f"[QUERY_REPONSE] Réponse : {answer[:100]}...")
@@ -1545,7 +1545,7 @@ async def vapi_webhook(request: Request):
     if isinstance(args, str):
         args = json.loads(args)
     question = args.get("question", "")
-    results  = search_documents(question, top_k=5)
+    results  = search_documents(question)
     answer   = generate_answer(question, results)
     return {"results": [{"toolCallId": call.get("id"), "result": answer}]}
 
@@ -1615,7 +1615,7 @@ async def build_questions(request: Request,
     logger.info(f"[CREATE_QUESTIONS] {requete_docs}")
 
     if requete_docs:
-        resultats = search_documents(requete_docs, top_k=5)
+        resultats = search_documents(requete_docs)
         documents = [r.get("contenu", "") for r in resultats]
     else:
         # Aucun repère du tout (premier contact, aucune localisation) :
@@ -1679,7 +1679,7 @@ async def stt_query_tts(
 
    
 
-    t0 = time.time(); results = search_documents(question, 20)
+    t0 = time.time(); results = search_documents(question)
     print(f"[PERF] RAG    : {(time.time()-t0)*1000:.0f}ms")
     print(f"[RESULTATS] {results}")
     t0 = time.time(); answer = generate_answer(question, results, salle_nom, exposition_nom, institution_nom, lang, guest_id=guest_id, bien_titre=bien_titre)
@@ -1732,7 +1732,7 @@ async def explain(req: ExplainRequest):
         raise HTTPException(status_code=503, detail="Kokoro non chargé.")
     print(f"langue {req.langue}")
     question = f"Explique le bien culturel : {req.bien_titre}"
-    results  = search_documents(question, req.top_k)
+    results  = search_documents(question)
 
     location_parts = []
     """
