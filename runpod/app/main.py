@@ -82,7 +82,7 @@ GEMINI_MODEL      = os.getenv("GEMINI_MODEL",      "gemini-2.5-flash-lite")
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL",     "large-v3")
 WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE",    "cuda")
 WHISPER_COMPUTE   = os.getenv("WHISPER_COMPUTE",   "float16")
-VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "/ia_culturel_app/runpod/app/audio.mp3, /ia_culturel_app/audio.wav")   # vide = recherche auto de audio.mp3
+VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "/ia_culturel_app/runpod/app/audio.wav, /ia_culturel_app/audio.wav")   # vide = recherche auto de audio.mp3
 POCKET_TTS_QUANTIZE        = os.getenv("POCKET_TTS_QUANTIZE", "0").strip().lower() in {"1", "true", "yes"}
 POCKET_TTS_VOICE_CACHE_DIR = os.getenv("POCKET_TTS_VOICE_CACHE_DIR", "")
 TTS_MAX_CHARS     = int(os.getenv("TTS_MAX_CHARS", "250"))
