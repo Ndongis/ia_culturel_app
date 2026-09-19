@@ -1196,48 +1196,62 @@ def text_to_speech(text: str, max_chars: int | None = None,
                    cache_key: str | None = None, langue: str | None = None) -> str:
     if not _voice_states:
         raise RuntimeError("Pocket TTS non initialisé")
-
+ 
     # 1. Nettoyage et normalisation immédiate du texte
     text = " ".join(text.split()).strip()
     if not text:
         raise ValueError("Texte vide")
-
+ 
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars].rstrip()
-
+ 
     # 2. Gestion rapide du cache
     key = cache_key or _audio_cache_key(text)
     cached = _get_cached_audio(key)
     if cached:
         return cached
-
+ 
     # 3. Résolution du modèle + voice_state global
     lang        = _resolve_lang(langue)
     name        = _pocket_name_for(lang)
     model       = _pocket_models[name]
     voice_state = _voice_states[name]
     t0 = time.time()
-
-    print(f"[TTS] Génération {len(text)} chars, model={name}, lang={lang}")
-
-    # 4. Synthèse — Pocket TTS gère lui-même les textes longs.
+ 
+    # 4. Découpage en phrases
+    segments = _split_sentences(text)
+    print(f"[TTS] Génération {len(text)} chars en {len(segments)} segment(s), model={name}, lang={lang}")
+ 
+    # 5. Synthèse de chaque phrase séparément (même voice_state => voix identique partout).
     # copy_state=True : le voice_state global n'est jamais modifié par la génération.
-    # Le lock évite deux générations simultanées sur la même instance de modèle.
-    with _pocket_locks[name]:
-        audio = model.generate_audio(voice_state, text, copy_state=True)
-
-    # 5. Conversion float -> int16 et écriture directe du fichier
-    samples  = audio.detach().cpu().numpy().astype(np.float32)
+    # Le lock est pris par phrase : deux requêtes simultanées s'intercalent au lieu de s'attendre.
+    sr    = model.sample_rate
+    pause = np.zeros(int(sr * TTS_PAUSE_MS / 1000), dtype=np.float32)
+    pieces: list[np.ndarray] = []
+    for idx, seg in enumerate(segments):
+        t_seg = time.time()
+        with _pocket_locks[name]:
+            audio = model.generate_audio(voice_state, seg, copy_state=True)
+        chunk = audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        if idx > 0 and len(pause):
+            pieces.append(pause)              # petit silence entre deux phrases
+        pieces.append(chunk)
+        print(f"[TTS]   segment {idx + 1}/{len(segments)} : {len(seg)} chars -> "
+              f"{len(chunk) / sr:.1f}s en {time.time() - t_seg:.2f}s")
+ 
+    # 6. Regroupement + conversion float -> int16 + écriture du fichier
+    samples  = np.concatenate(pieces)
     audio_np = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     pathlib.Path(AUDIO_CACHE_DIR).mkdir(parents=True, exist_ok=True)
     wav_path = str(pathlib.Path(AUDIO_CACHE_DIR) / f"tts_{key}.wav")
-    _wav.write(wav_path, model.sample_rate, audio_np)
+    _wav.write(wav_path, sr, audio_np)
     _set_cached_audio(key, wav_path)
-
-    duree = len(audio_np) / model.sample_rate
-    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}  {text}s "
+ 
+    duree = len(audio_np) / sr
+    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s "
           f"({name} {lang})")
     return wav_path
+ 
 
 
 def _tts_safe(text: str, max_chars: int | None = None, cache_key: str | None = None, langue:str=None) -> str | None:
