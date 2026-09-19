@@ -18,7 +18,9 @@ Variables d'environnement :
     POCKET_TTS_MODEL_FR     modèle Pocket TTS pour le français  (défaut french_24l)
     POCKET_TTS_MODEL_EN     modèle Pocket TTS pour l'anglais    (défaut english)
     POCKET_TTS_MODEL_ES     modèle Pocket TTS pour l'espagnol   (défaut spanish_24l)
-    POCKET_TTS_QUANTIZE     1 = quantization int8 (CPU, moins de RAM, plus rapide) (défaut 0)
+    POCKET_TTS_DEVICE       device de Pocket TTS : cuda, cuda:0 ou cpu (défaut cuda ; repli CPU
+                            automatique si CUDA est indisponible)
+    POCKET_TTS_QUANTIZE     1 = quantization int8 (CPU uniquement, ignorée sur CUDA) (défaut 0)
     POCKET_TTS_VOICE_CACHE_DIR  dossier du cache des voice_state .safetensors
                             (défaut $AUDIO_CACHE_DIR/voice_states)
     TTS_MAX_CHARS           nb max de caractères (défaut 250)
@@ -89,6 +91,7 @@ WHISPER_MODEL     = os.getenv("WHISPER_MODEL",     "large-v3")
 WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE",    "cuda")
 WHISPER_COMPUTE   = os.getenv("WHISPER_COMPUTE",   "float16")
 VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "/ia_culturel_app/runpod/app/audio.wav")   # défaut : chemin RunPod ; vide = recherche auto de audio.mp3
+POCKET_TTS_DEVICE          = os.getenv("POCKET_TTS_DEVICE", "cuda")   # "cuda", "cuda:0" ou "cpu"
 POCKET_TTS_QUANTIZE        = os.getenv("POCKET_TTS_QUANTIZE", "0").strip().lower() in {"1", "true", "yes"}
 POCKET_TTS_VOICE_CACHE_DIR = os.getenv("POCKET_TTS_VOICE_CACHE_DIR", "")
 TTS_MAX_CHARS     = int(os.getenv("TTS_MAX_CHARS", "250"))
@@ -1142,7 +1145,11 @@ def _load_voice_state(model, name: str, audio_path: pathlib.Path):
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        export_model_state(state, str(cache_file))
+        # Export depuis des tensors CPU : le fichier ne dépend pas du device utilisé
+        # (au rechargement, Pocket TTS le replace sur le device du modèle)
+        cpu_state = {mod: {k: v.detach().cpu() for k, v in tensors.items()}
+                     for mod, tensors in state.items()}
+        export_model_state(cpu_state, str(cache_file))
     except Exception as exc:
         print(f"[TTS] WARN export du voice_state impossible : {exc}")
     return state
@@ -1164,31 +1171,69 @@ def _hf_login() -> None:
         print(f"[TTS] WARN login Hugging Face impossible : {' '.join(str(exc).split())[:200]}")
 
 
-def _load_pocket_tts() -> None:
-    """Charge les modèles Pocket TTS et calcule UNE FOIS le voice_state global
-    (clonage de audio.mp3) pour chaque modèle."""
+def _pocket_device() -> str:
+    """Device demandé pour Pocket TTS, avec repli CPU si CUDA n'est pas disponible."""
+    dev = (POCKET_TTS_DEVICE or "cpu").strip().lower()
+    if dev.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[TTS] WARN device '{dev}' demandé mais CUDA indisponible — Pocket TTS tourne sur CPU")
+        return "cpu"
+    return dev
+
+
+def _build_pocket_model(name: str, audio_path: pathlib.Path, device: str):
+    """Charge un modèle sur `device`, clone la voix et fait un warm-up.
+
+    Ordre important : .to(device) AVANT le voice_state, car l'encodage de l'audio et
+    l'état de voix sont créés sur le device courant du modèle (sinon : tensors sur 2 devices).
+    """
     from pocket_tts import TTSModel
 
+    quantize = POCKET_TTS_QUANTIZE and device == "cpu"
+    if POCKET_TTS_QUANTIZE and not quantize:
+        print("[TTS] POCKET_TTS_QUANTIZE ignoré sur CUDA (quantization int8 prévue pour CPU)")
+
+    model = TTSModel.load_model(language=name, quantize=quantize)
+    if device != "cpu":
+        model.to(device)
+    state = _load_voice_state(model, name, audio_path)
+    # Warm-up : évite de payer l'init CUDA / les allocations du 1er appel sur un vrai visiteur
+    model.generate_audio(state, "Test.", copy_state=True)
+    return model, state
+
+
+def _load_pocket_tts() -> None:
+    """Charge les modèles Pocket TTS (sur CUDA si possible) et calcule UNE FOIS le
+    voice_state global (clonage de audio.mp3) pour chaque modèle."""
     audio_path = _find_voice_audio()
     print(f"[TTS] Pocket TTS — voix clonée depuis {audio_path}")
     _hf_login()
+
+    device = _pocket_device()
+    gpu = f" ({torch.cuda.get_device_name(0)})" if device.startswith("cuda") else ""
+    print(f"[TTS] Device Pocket TTS : {device}{gpu}")
     t0 = time.time()
 
     for lang, name in _POCKET_MODEL_MAP.items():
         if name in _pocket_models:      # modèle déjà chargé (partagé entre langues)
             continue
         try:
-            t_m   = time.time()
-            model = TTSModel.load_model(language=name, quantize=POCKET_TTS_QUANTIZE)
-            state = _load_voice_state(model, name, audio_path)
-            # Warm-up : évite de payer les allocations du 1er appel sur un vrai visiteur
-            model.generate_audio(state, "Test.", copy_state=True)
+            t_m = time.time()
+            try:
+                model, state = _build_pocket_model(name, audio_path, device)
+            except Exception as exc:
+                if device == "cpu":
+                    raise
+                # Ex. mémoire GPU saturée (Whisper, e5, reranker…) : on retente ce modèle sur CPU
+                print(f"[TTS] WARN '{name}' a échoué sur {device} "
+                      f"({' '.join(str(exc).split())[:160]}) — nouvel essai sur CPU")
+                torch.cuda.empty_cache()
+                model, state = _build_pocket_model(name, audio_path, "cpu")
 
             _pocket_models[name] = model
             _pocket_locks[name]  = threading.Lock()
             _voice_states[name]  = state
             print(f"[TTS] Modèle '{name}' ({lang}) prêt en {time.time() - t_m:.1f}s "
-                  f"| {model.sample_rate} Hz")
+                  f"| {model.sample_rate} Hz | device={getattr(model, 'device', '?')}")
         except Exception as exc:
             print(f"[TTS] WARN modèle '{name}' ({lang}) non chargé : {exc}")
 
