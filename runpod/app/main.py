@@ -22,6 +22,10 @@ Variables d'environnement :
     POCKET_TTS_VOICE_CACHE_DIR  dossier du cache des voice_state .safetensors
                             (défaut $AUDIO_CACHE_DIR/voice_states)
     TTS_MAX_CHARS           nb max de caractères (défaut 250)
+    TTS_PAUSE_MS            silence inséré entre deux phrases regroupées, en ms (défaut 150)
+    TTS_MIN_SEGMENT_CHARS   longueur mini d'un segment avant synthèse ; les phrases plus
+                            courtes ("Oui.", "M.") sont fusionnées avec la suivante (défaut 25)
+    HUGGINGFACE_TOKEN       token Hugging Face (ou HF_TOKEN) pour les poids Pocket TTS avec clonage
 
     URL_EXPOSITIONS         http://localhost:8282/api/expositions
     URL_THEMES              http://localhost:8282/api/themes
@@ -84,10 +88,12 @@ GEMINI_MODEL      = os.getenv("GEMINI_MODEL",      "gemini-2.5-flash-lite")
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL",     "large-v3")
 WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE",    "cuda")
 WHISPER_COMPUTE   = os.getenv("WHISPER_COMPUTE",   "float16")
-VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "/ia_culturel_app/runpod/app/audio.wav")   # vide = recherche auto de audio.mp3
+VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "/ia_culturel_app/runpod/app/audio.wav")   # défaut : chemin RunPod ; vide = recherche auto de audio.mp3
 POCKET_TTS_QUANTIZE        = os.getenv("POCKET_TTS_QUANTIZE", "0").strip().lower() in {"1", "true", "yes"}
 POCKET_TTS_VOICE_CACHE_DIR = os.getenv("POCKET_TTS_VOICE_CACHE_DIR", "")
 TTS_MAX_CHARS     = int(os.getenv("TTS_MAX_CHARS", "250"))
+TTS_PAUSE_MS      = int(os.getenv("TTS_PAUSE_MS", "150"))
+TTS_MIN_SEGMENT_CHARS = int(os.getenv("TTS_MIN_SEGMENT_CHARS", "25"))
 EMBED_MODEL       = os.getenv("EMBED_MODEL",       "intfloat/multilingual-e5-base")
 CACHE_TTL         = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 ANSWER_CACHE_TTL  = int(os.getenv("ANSWER_CACHE_TTL",  "1800"))
@@ -96,7 +102,7 @@ EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE",   "64"))
 AUDIO_CACHE_DIR   = os.getenv("AUDIO_CACHE_DIR",   "/audio_cache")
 AUDIO_CACHE_TTL   = int(os.getenv("AUDIO_CACHE_TTL",    "86400"))
 TOP_K_DEFAULT     = int(os.getenv("TOP_K_DEFAULT",      "3"))
-HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN", "")
 API_GATEWAY = os.getenv("API_GATEWAY")
 URL_EXPOSITIONS  = f"{API_GATEWAY}/expositions/api/expositions"
 URL_THEMES       = f"{API_GATEWAY}/expositions/api/themes"
@@ -188,7 +194,6 @@ _embeddings:     np.ndarray            = None
 _metadata:       list[dict]            = []
 _cache_built_at: float                 = 0.0
 _answer_cache:   TTLCache              = None
-login(token=HUGGINGFACE_TOKEN)
 # Historique des 3 derniers échanges (question, réponse) par visiteur (guest_id),
 # pour donner du contexte de conversation à Gemini sans mélanger les visiteurs
 # entre eux. Durée de validité illimitée (pas de TTL, simple dict) : l'historique
@@ -1143,6 +1148,22 @@ def _load_voice_state(model, name: str, audio_path: pathlib.Path):
     return state
 
 
+def _hf_login() -> None:
+    """Authentifie l'app auprès de Hugging Face (poids Pocket TTS avec clonage = dépôt gated).
+
+    Ne plante jamais : login('') lève une exception, donc on ne l'appelle que si un token existe.
+    """
+    if not HUGGINGFACE_TOKEN:
+        print("[TTS] WARN aucun token Hugging Face (HUGGINGFACE_TOKEN ou HF_TOKEN) : "
+              "le clonage de voix échouera si le dépôt gated n'est pas déjà en cache")
+        return
+    try:
+        login(token=HUGGINGFACE_TOKEN)
+        print("[TTS] Connecté à Hugging Face")
+    except Exception as exc:
+        print(f"[TTS] WARN login Hugging Face impossible : {' '.join(str(exc).split())[:200]}")
+
+
 def _load_pocket_tts() -> None:
     """Charge les modèles Pocket TTS et calcule UNE FOIS le voice_state global
     (clonage de audio.mp3) pour chaque modèle."""
@@ -1150,6 +1171,7 @@ def _load_pocket_tts() -> None:
 
     audio_path = _find_voice_audio()
     print(f"[TTS] Pocket TTS — voix clonée depuis {audio_path}")
+    _hf_login()
     t0 = time.time()
 
     for lang, name in _POCKET_MODEL_MAP.items():
@@ -1190,6 +1212,10 @@ def _pocket_name_for(lang: str) -> str:
 def get_voice_state(langue: str | None = None):
     """Récupération globale du voice_state cloné (calculé au démarrage, jamais recalculé)."""
     return _voice_states[_pocket_name_for(_resolve_lang(langue))]
+
+# Coupe après . ! ? … suivis d'un espace (les décimaux "3.5" et "www.site.fr" ne sont pas coupés)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
 
 def _split_sentences(text: str, min_chars: int | None = None) -> list[str]:
     """Découpe `text` en phrases (aux points), en fusionnant les phrases trop courtes.
