@@ -53,6 +53,8 @@ from functools import lru_cache
 from math import gcd
 import logging
 from sentence_transformers import CrossEncoder
+from huggingface_hub import login
+
 # Récupérer le logger d'uvicorn
 logger = logging.getLogger("uvicorn.error")
 
@@ -94,6 +96,7 @@ EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE",   "64"))
 AUDIO_CACHE_DIR   = os.getenv("AUDIO_CACHE_DIR",   "/audio_cache")
 AUDIO_CACHE_TTL   = int(os.getenv("AUDIO_CACHE_TTL",    "86400"))
 TOP_K_DEFAULT     = int(os.getenv("TOP_K_DEFAULT",      "3"))
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 API_GATEWAY = os.getenv("API_GATEWAY")
 URL_EXPOSITIONS  = f"{API_GATEWAY}/expositions/api/expositions"
 URL_THEMES       = f"{API_GATEWAY}/expositions/api/themes"
@@ -185,6 +188,7 @@ _embeddings:     np.ndarray            = None
 _metadata:       list[dict]            = []
 _cache_built_at: float                 = 0.0
 _answer_cache:   TTLCache              = None
+login(token=HUGGINGFACE_TOKEN)
 # Historique des 3 derniers échanges (question, réponse) par visiteur (guest_id),
 # pour donner du contexte de conversation à Gemini sans mélanger les visiteurs
 # entre eux. Durée de validité illimitée (pas de TTL, simple dict) : l'historique
