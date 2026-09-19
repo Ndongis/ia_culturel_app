@@ -13,9 +13,14 @@ Variables d'environnement :
     ANSWER_CACHE_SIZE       taille max du cache réponses (défaut 200)
     EMBED_BATCH_SIZE        batch size embeddings (défaut 64)
     TOP_K_DEFAULT           top-k par défaut (défaut 3)
-    KOKORO_VOICE            voix kokoro-onnx (défaut ff_siwis)
-    KOKORO_SPEED            vitesse TTS (défaut 1.0)
-    KOKORO_MODEL_DIR        dossier modèles onnx (défaut /app/kokoro_models)
+    VOICE_AUDIO_PATH        chemin de l'échantillon de voix à cloner (défaut : audio.mp3
+                            à côté de main.py, puis dans le cwd, puis /app/audio.mp3)
+    POCKET_TTS_MODEL_FR     modèle Pocket TTS pour le français  (défaut french_24l)
+    POCKET_TTS_MODEL_EN     modèle Pocket TTS pour l'anglais    (défaut english)
+    POCKET_TTS_MODEL_ES     modèle Pocket TTS pour l'espagnol   (défaut spanish_24l)
+    POCKET_TTS_QUANTIZE     1 = quantization int8 (CPU, moins de RAM, plus rapide) (défaut 0)
+    POCKET_TTS_VOICE_CACHE_DIR  dossier du cache des voice_state .safetensors
+                            (défaut $AUDIO_CACHE_DIR/voice_states)
     TTS_MAX_CHARS           nb max de caractères (défaut 250)
 
     URL_EXPOSITIONS         http://localhost:8282/api/expositions
@@ -77,9 +82,9 @@ GEMINI_MODEL      = os.getenv("GEMINI_MODEL",      "gemini-2.5-flash-lite")
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL",     "large-v3")
 WHISPER_DEVICE    = os.getenv("WHISPER_DEVICE",    "cuda")
 WHISPER_COMPUTE   = os.getenv("WHISPER_COMPUTE",   "float16")
-KOKORO_VOICE      = os.getenv("KOKORO_VOICE",      "ff_siwis")
-KOKORO_SPEED      = float(os.getenv("KOKORO_SPEED",      "1.0"))
-KOKORO_MODEL_DIR  = os.getenv("KOKORO_MODEL_DIR",  "/kokoro_models")
+VOICE_AUDIO_PATH  = os.getenv("VOICE_AUDIO_PATH",  "")   # vide = recherche auto de audio.mp3
+POCKET_TTS_QUANTIZE        = os.getenv("POCKET_TTS_QUANTIZE", "0").strip().lower() in {"1", "true", "yes"}
+POCKET_TTS_VOICE_CACHE_DIR = os.getenv("POCKET_TTS_VOICE_CACHE_DIR", "")
 TTS_MAX_CHARS     = int(os.getenv("TTS_MAX_CHARS", "250"))
 EMBED_MODEL       = os.getenv("EMBED_MODEL",       "intfloat/multilingual-e5-base")
 CACHE_TTL         = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
@@ -100,16 +105,15 @@ URL_INSTITUTIONS = f"{API_GATEWAY}/institutions/api/institutions"
 DATABASE_URL = "postgresql://postgres:123@localhost:5432/vectordb"
 conn = None  # Connexion à la base de données (si nécessaire)
 cur = None   # Curseur pour exécuter les requêtes SQL
-_KOKORO_VOICE_MAP = {
-    "fr": os.getenv("KOKORO_VOICE_FR", "ff_siwis"),
-    "en": os.getenv("KOKORO_VOICE_EN", "af_heart"),
-    "es": os.getenv("KOKORO_VOICE_ES", "ef_dora"),
+# Pocket TTS : un modèle par langue (le voice_state est propre à chaque modèle).
+# Si plusieurs langues pointent vers le même nom de modèle, il n'est chargé qu'une fois.
+_POCKET_MODEL_MAP = {
+    "fr": os.getenv("POCKET_TTS_MODEL_FR", "french_24l"),
+    "en": os.getenv("POCKET_TTS_MODEL_EN", "english"),
+    "es": os.getenv("POCKET_TTS_MODEL_ES", "spanish_24l"),
 }
-_KOKORO_LANG_MAP = {"fr": "fr-fr", "en": "en-us", "es": "es"}
-# Codes langue pour kokoro (PyTorch, KPipeline) — une lettre par langue,
-# différent du format "fr-fr" utilisé par l'ancien kokoro-onnx.
-_KOKORO_PT_LANG_CODE = {"fr": "f", "en": "a", "es": "e"}
-_KOKORO_ORIGINAL_LANG = {"fr": "francais", "en": "anglais", "es": "espagnol"}
+# Nom de la langue injecté dans les prompts Gemini (n'a rien à voir avec le TTS)
+_LANG_NAMES = {"fr": "francais", "en": "anglais", "es": "espagnol"}
 _SUPPORTED_LANGS = {"fr", "en", "es"}
 
 _CORS_ORIGINS_DEFAULT = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://localhost:8080"
@@ -189,7 +193,10 @@ _answer_cache:   TTLCache              = None
 _conversation_histories: dict         = None
 HISTORY_MAXLEN = 3
 _audio_cache:    dict                  = {}
-_kokoro_pipelines: dict                = {}
+# Pocket TTS — tout est indexé par nom de modèle (ex: "french_24l")
+_pocket_models:  dict                  = {}   # nom -> TTSModel
+_pocket_locks:   dict                  = {}   # nom -> threading.Lock (1 génération à la fois par modèle)
+_voice_states:   dict                  = {}   # nom -> voice_state GLOBAL cloné depuis audio.mp3
 _whisper_model                         = None
 data = None
 reranker=None
@@ -947,7 +954,7 @@ def generate_answer(question: str, results: list,
     try:
         # Nettoyage et récupération de la langue cible
         langue_str = str(langue).strip().lower() if langue else "fr"
-        langue_resolue = _KOKORO_ORIGINAL_LANG.get(langue_str, "francais")
+        langue_resolue = _LANG_NAMES.get(langue_str, "francais")
         print(f"[Génération] Question : {question[:50]} | Langue : {langue_resolue} | Visiteur : {guest_id} | Bien : {bien_titre}")
         # Construction sécurisée du prompt
         prompt_complet = _build_prompt(question, results, salle_nom, exposition_nom, institution_nom,
@@ -999,7 +1006,7 @@ def generate_suggested_questions(question: str | None = None, answer: str | None
         return []
 
     langue_str = str(langue).strip().lower() if langue else "fr"
-    langue_resolue = _KOKORO_ORIGINAL_LANG.get(langue_str, "francais")
+    langue_resolue = _LANG_NAMES.get(langue_str, "francais")
 
     contexte = ""
     if question:
@@ -1046,7 +1053,7 @@ def generate_suggested_questions(question: str | None = None, answer: str | None
         return []
 
 
-# ── TTS — Kokoro (PyTorch) ────────────────────────────────────────────────────
+# ── TTS — Pocket TTS (Kyutai) + clonage de voix ───────────────────────────────
 
 def _audio_cache_key(text: str) -> str:
     return hashlib.md5(text.strip().encode()).hexdigest()
@@ -1070,75 +1077,127 @@ def _set_cached_audio(key: str, wav_path: str) -> None:
     print(f"[CACHE] Sauvegardé audio : {key[:16]}")
 
 
-def kokoro_ready() -> bool:
-    return bool(_kokoro_pipelines)
+def tts_ready() -> bool:
+    return bool(_voice_states)
 
 
-def _load_kokoro() -> None:
-    global _kokoro_pipelines
-    from kokoro import KPipeline
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[TTS] Chargement kokoro (PyTorch, device={device})...")
+def _find_voice_audio() -> pathlib.Path:
+    """Localise l'échantillon de voix à cloner (audio.mp3)."""
+    if VOICE_AUDIO_PATH:   # chemin explicite : on n'essaie rien d'autre
+        explicit = pathlib.Path(VOICE_AUDIO_PATH)
+        if explicit.is_file():
+            return explicit
+        raise FileNotFoundError(f"VOICE_AUDIO_PATH={explicit} introuvable.")
+
+    candidates = [
+        pathlib.Path(__file__).resolve().parent / "audio.mp3",
+        pathlib.Path.cwd() / "audio.mp3",
+        pathlib.Path("/app/audio.mp3"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    raise FileNotFoundError(
+        "audio.mp3 introuvable. Chemins testés : "
+        + ", ".join(str(c) for c in candidates)
+        + " — définir VOICE_AUDIO_PATH."
+    )
+
+
+def _load_voice_state(model, name: str, audio_path: pathlib.Path):
+    """Clone la voix de `audio_path` pour `model` et renvoie le voice_state.
+
+    Le clonage depuis un mp3 est lent : le résultat est exporté en .safetensors
+    (nommé d'après le hash du fichier audio) et rechargé instantanément aux
+    démarrages suivants. Si audio.mp3 change, le hash change et le cache est recalculé.
+    """
+    from pocket_tts import export_model_state
+
+    digest    = hashlib.md5(audio_path.read_bytes()).hexdigest()[:10]
+    cache_dir = (pathlib.Path(POCKET_TTS_VOICE_CACHE_DIR) if POCKET_TTS_VOICE_CACHE_DIR
+                 else pathlib.Path(AUDIO_CACHE_DIR) / "voice_states")
+    cache_file = cache_dir / f"voice_{name}_{digest}.safetensors"
+
+    if cache_file.is_file():
+        try:
+            state = model.get_state_for_audio_prompt(str(cache_file))
+            print(f"[TTS] voice_state '{name}' rechargé depuis le cache ({cache_file.name})")
+            return state
+        except Exception as exc:
+            print(f"[TTS] Cache voice_state illisible ({exc}) — recalcul depuis {audio_path.name}")
+
     t0 = time.time()
-    for lang, pt_lang_code in _KOKORO_PT_LANG_CODE.items():
-        _kokoro_pipelines[lang] = KPipeline(lang_code=pt_lang_code, device=device)
-    # Warm-up : évite de payer le coût du premier appel (recherche d'algo
-    # cuDNN, allocation mémoire) au moment où un vrai visiteur pose une question.
-    for lang, pipeline in _kokoro_pipelines.items():
-        voice = _KOKORO_VOICE_MAP.get(lang, KOKORO_VOICE)
-        list(pipeline("Test.", voice=voice, speed=1.0))
-    print(f"[TTS] Kokoro (PyTorch) prêt en {time.time() - t0:.1f}s")
+    # truncate=True : Pocket TTS n'exploite que ~30 s d'échantillon
+    state = model.get_state_for_audio_prompt(str(audio_path), truncate=True)
+    print(f"[TTS] voice_state '{name}' cloné depuis {audio_path.name} en {time.time() - t0:.1f}s")
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        export_model_state(state, str(cache_file))
+    except Exception as exc:
+        print(f"[TTS] WARN export du voice_state impossible : {exc}")
+    return state
 
 
-import re
-import time
-import pathlib
+def _load_pocket_tts() -> None:
+    """Charge les modèles Pocket TTS et calcule UNE FOIS le voice_state global
+    (clonage de audio.mp3) pour chaque modèle."""
+    from pocket_tts import TTSModel
 
-# Seuil relevé : Kokoro gère bien des textes plus longs en un seul appel,
-# ce qui évite le coût fixe (phonémisation espeak + lancement CUDA) de chaque appel.
-SEUIL_DECOUPAGE = 300
+    audio_path = _find_voice_audio()
+    print(f"[TTS] Pocket TTS — voix clonée depuis {audio_path}")
+    t0 = time.time()
 
-# Taille cible d'un segment après regroupement (évite trop de tout petits appels
-# même quand le texte doit être découpé sur . ! ?)
-TAILLE_SEGMENT_CIBLE = 250
+    for lang, name in _POCKET_MODEL_MAP.items():
+        if name in _pocket_models:      # modèle déjà chargé (partagé entre langues)
+            continue
+        try:
+            t_m   = time.time()
+            model = TTSModel.load_model(language=name, quantize=POCKET_TTS_QUANTIZE)
+            state = _load_voice_state(model, name, audio_path)
+            # Warm-up : évite de payer les allocations du 1er appel sur un vrai visiteur
+            model.generate_audio(state, "Test.", copy_state=True)
 
+            _pocket_models[name] = model
+            _pocket_locks[name]  = threading.Lock()
+            _voice_states[name]  = state
+            print(f"[TTS] Modèle '{name}' ({lang}) prêt en {time.time() - t_m:.1f}s "
+                  f"| {model.sample_rate} Hz")
+        except Exception as exc:
+            print(f"[TTS] WARN modèle '{name}' ({lang}) non chargé : {exc}")
 
-def _decouper_phrases(text: str) -> list[str]:
-    """Découpe uniquement sur la ponctuation forte (. ! ?), jamais sur la virgule.
-    Les virgules n'ont pas besoin d'être des points de coupe : Kokoro gère
-    très bien les pauses internes d'une phrase."""
-    return [p.strip() for p in re.split(r'(?<=[.!?])\s+', text) if p.strip()]
-
-
-def _regrouper_segments(parts: list[str], taille_max: int = TAILLE_SEGMENT_CIBLE) -> list[str]:
-    """Regroupe des phrases courtes ensemble pour minimiser le nombre d'appels
-    à pipeline(), tout en respectant une taille max par appel."""
-    groupes: list[str] = []
-    courant = ""
-    for p in parts:
-        candidat = f"{courant} {p}".strip() if courant else p
-        if len(candidat) <= taille_max:
-            courant = candidat
-        else:
-            if courant:
-                groupes.append(courant)
-            courant = p
-    if courant:
-        groupes.append(courant)
-    return groupes
+    if not _voice_states:
+        raise RuntimeError("Aucun modèle Pocket TTS n'a pu être chargé")
+    print(f"[TTS] Pocket TTS prêt en {time.time() - t0:.1f}s ({len(_voice_states)} modèle(s))")
 
 
-def text_to_speech(text: str, speed: float = KOKORO_SPEED, max_chars: int | None = None,
-                    cache_key: str | None = None, langue: str | None = None) -> str:
-    if not _kokoro_pipelines:
-        raise RuntimeError("Kokoro non initialisé")
+def _pocket_name_for(lang: str) -> str:
+    """Nom du modèle à utiliser pour `lang`, avec repli si celui-ci n'est pas chargé."""
+    name = _POCKET_MODEL_MAP.get(lang)
+    if name in _voice_states:
+        return name
+    for fallback in _POCKET_MODEL_MAP.values():
+        if fallback in _voice_states:
+            print(f"[TTS] WARN modèle '{name}' indisponible pour '{lang}' — repli sur '{fallback}'")
+            return fallback
+    raise RuntimeError("Pocket TTS non initialisé")
+
+
+def get_voice_state(langue: str | None = None):
+    """Récupération globale du voice_state cloné (calculé au démarrage, jamais recalculé)."""
+    return _voice_states[_pocket_name_for(_resolve_lang(langue))]
+
+
+def text_to_speech(text: str, max_chars: int | None = None,
+                   cache_key: str | None = None, langue: str | None = None) -> str:
+    if not _voice_states:
+        raise RuntimeError("Pocket TTS non initialisé")
 
     # 1. Nettoyage et normalisation immédiate du texte
     text = " ".join(text.split()).strip()
     if not text:
         raise ValueError("Texte vide")
 
-    # Troncature optionnelle si demandée (paramètre existant, désormais utilisé)
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars].rstrip()
 
@@ -1148,52 +1207,39 @@ def text_to_speech(text: str, speed: float = KOKORO_SPEED, max_chars: int | None
     if cached:
         return cached
 
-    # 3. Résolution des paramètres du modèle
-    lang = _resolve_lang(langue)
-    voice = _KOKORO_VOICE_MAP.get(lang, KOKORO_VOICE)
-    pipeline = _kokoro_pipelines.get(lang)
-    if pipeline is None:
-        raise RuntimeError(f"Kokoro non initialisé pour la langue : {lang}")
+    # 3. Résolution du modèle + voice_state global
+    lang        = _resolve_lang(langue)
+    name        = _pocket_name_for(lang)
+    model       = _pocket_models[name]
+    voice_state = _voice_states[name]
     t0 = time.time()
 
-    print(f"[TTS] Génération {len(text)} chars, voice={voice}, lang={lang}, speed={speed}")
+    print(f"[TTS] Génération {len(text)} chars, model={name}, lang={lang}")
 
-    # 4. Synthèse adaptative (Directe vs Découpée + regroupée)
-    if len(text) <= SEUIL_DECOUPAGE:
-        segments = [text]
-    else:
-        phrases = _decouper_phrases(text)
-        segments = _regrouper_segments(phrases, TAILLE_SEGMENT_CIBLE)
+    # 4. Synthèse — Pocket TTS gère lui-même les textes longs.
+    # copy_state=True : le voice_state global n'est jamais modifié par la génération.
+    # Le lock évite deux générations simultanées sur la même instance de modèle.
+    with _pocket_locks[name]:
+        audio = model.generate_audio(voice_state, text, copy_state=True)
 
-    all_s, sample_rate = [], 24000  # sample rate fixe pour kokoro (PyTorch)
-    for seg in segments:
-        t_seg = time.time()
-        chunks = [
-            audio.detach().cpu().numpy() if hasattr(audio, "detach") else audio
-            for _graphemes, _phonemes, audio in pipeline(seg, voice=voice, speed=speed)
-        ]
-        s = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-        all_s.append(s)
-        # Log de debug par segment — utile pour repérer un segment anormalement lent.
-        # Commentez cette ligne si le volume de logs devient trop important en prod.
-        print(f"[TTS-seg] {len(seg)} chars en {time.time() - t_seg:.3f}s : {seg[:50]!r}")
-
-    samples = np.concatenate(all_s) if len(all_s) > 1 else all_s[0]
-
-    # 5. Conversion et écriture directe du fichier
+    # 5. Conversion float -> int16 et écriture directe du fichier
+    samples  = audio.detach().cpu().numpy().astype(np.float32)
     audio_np = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    pathlib.Path(AUDIO_CACHE_DIR).mkdir(parents=True, exist_ok=True)
     wav_path = str(pathlib.Path(AUDIO_CACHE_DIR) / f"tts_{key}.wav")
-    _wav.write(wav_path, sample_rate, audio_np)
+    _wav.write(wav_path, model.sample_rate, audio_np)
     _set_cached_audio(key, wav_path)
 
-    print(f"[TTS] {len(text)} chars générés en {time.time() - t0:.2f}s "
-          f"({len(segments)} segment(s)) {voice} {lang}")
+    duree = len(audio_np) / model.sample_rate
+    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s "
+          f"({name} {lang})")
     return wav_path
 
+
 def _tts_safe(text: str, max_chars: int | None = None, cache_key: str | None = None, langue:str=None) -> str | None:
-    """TTS sans exception — retourne None si Kokoro non chargé."""
-    if not kokoro_ready():
-        print("[TTS] Kokoro non chargé — fallback silencieux")
+    """TTS sans exception — retourne None si Pocket TTS non chargé."""
+    if not tts_ready():
+        print("[TTS] Pocket TTS non chargé — fallback silencieux")
         return None
     try:
         return text_to_speech(text, max_chars=max_chars, cache_key=cache_key, langue=langue)
@@ -1417,11 +1463,11 @@ def initialize() -> None:
     _conversation_histories = {}
     print("  Historiques par visiteur : illimités (pas de TTL, dict en mémoire)")
 
-    print("=== STEP 5 : chargement Kokoro (PyTorch) ===")
+    print("=== STEP 5 : chargement Pocket TTS + clonage de voix (audio.mp3) ===")
     try:
-        _load_kokoro()
+        _load_pocket_tts()
     except Exception as e:
-        print(f"  WARN Kokoro : {e}")
+        print(f"  WARN Pocket TTS : {e}")
 
     print("=== STEP 6 : chargement Faster-Whisper ===")
     try:
@@ -1473,7 +1519,7 @@ class QueryRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text:  str
-    speed: float = 1.0
+    speed: float = 1.0   # conservé pour compatibilité client — ignoré (Pocket TTS n'a pas de réglage de vitesse)
 
 
 class ExplainRequest(BaseModel):
@@ -1710,10 +1756,10 @@ async def stt_query_tts(
 def tts(req: TTSRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Champ 'text' vide.")
-    if not kokoro_ready():
-        raise HTTPException(status_code=503, detail="Kokoro non encore chargé.")
+    if not tts_ready():
+        raise HTTPException(status_code=503, detail="Pocket TTS non encore chargé.")
     try:
-        return FileResponse(text_to_speech(req.text, req.speed),
+        return FileResponse(text_to_speech(req.text),
                             media_type="audio/wav", filename="tts.wav")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur TTS : {exc}")
@@ -1741,8 +1787,8 @@ async def explain(req: ExplainRequest):
         raise HTTPException(status_code=400, detail="Champ 'bien_titre' vide.")
     if not _llm:
         raise HTTPException(status_code=503, detail="Gemini non configuré.")
-    if not kokoro_ready():
-        raise HTTPException(status_code=503, detail="Kokoro non chargé.")
+    if not tts_ready():
+        raise HTTPException(status_code=503, detail="Pocket TTS non chargé.")
     print(f"langue {req.langue}")
     question = f"Explique le bien culturel : {req.bien_titre}"
     results  = search_documents(question,limit=10, top_k=5)
