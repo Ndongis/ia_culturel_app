@@ -1191,6 +1191,31 @@ def get_voice_state(langue: str | None = None):
     """Récupération globale du voice_state cloné (calculé au démarrage, jamais recalculé)."""
     return _voice_states[_pocket_name_for(_resolve_lang(langue))]
 
+def _split_sentences(text: str, min_chars: int | None = None) -> list[str]:
+    """Découpe `text` en phrases (aux points), en fusionnant les phrases trop courtes.
+ 
+    Les phrases < min_chars ("Oui.", "M.", "Dr.") sont rattachées à la suivante :
+    une synthèse sur un segment minuscule sonne mal et coûte un appel complet.
+    """
+    if min_chars is None:
+        min_chars = TTS_MIN_SEGMENT_CHARS
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+ 
+    segments: list[str] = []
+    buf = ""
+    for part in parts:
+        buf = f"{buf} {part}" if buf else part
+        if len(buf) >= min_chars:
+            segments.append(buf)
+            buf = ""
+    if buf:                                   # reste trop court -> rattaché au segment précédent
+        if segments:
+            segments[-1] = f"{segments[-1]} {buf}"
+        else:
+            segments.append(buf)
+    return segments
+ 
+
 
 def text_to_speech(text: str, max_chars: int | None = None,
                    cache_key: str | None = None, langue: str | None = None) -> str:
@@ -1248,7 +1273,7 @@ def text_to_speech(text: str, max_chars: int | None = None,
     _set_cached_audio(key, wav_path)
  
     duree = len(audio_np) / sr
-    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s  {text}"
+    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s "
           f"({name} {lang})")
     return wav_path
  
