@@ -1248,7 +1248,7 @@ def text_to_speech(text: str, max_chars: int | None = None,
     _set_cached_audio(key, wav_path)
  
     duree = len(audio_np) / sr
-    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s "
+    print(f"[TTS] {len(text)} chars -> {duree:.1f}s d'audio générés en {time.time() - t0:.2f}s  {text}"
           f"({name} {lang})")
     return wav_path
  
