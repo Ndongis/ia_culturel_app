@@ -1744,7 +1744,7 @@ async def explain(req: ExplainRequest):
         raise HTTPException(status_code=503, detail="Kokoro non chargé.")
     print(f"langue {req.langue}")
     question = f"Explique le bien culturel : {req.bien_titre}"
-    results  = search_documents(question,limit=20, top_k=5)
+    results  = search_documents(question,limit=5, top_k=5)
 
     location_parts = []
     """
