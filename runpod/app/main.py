@@ -345,14 +345,13 @@ def insert_biens(biens):
             json.dumps({
                 "type": "bien",
                 "id": bien.get("id"),
+                "titre": bien.get("titre"),
                 "institution_id": bien.get("institution_id"),
                 "artiste_id": bien.get("artiste_id"),
             })
         )),
 
-
     conn.commit()
-
 # ============================================================
 # BUILD TEXT THEMES
 # ============================================================
