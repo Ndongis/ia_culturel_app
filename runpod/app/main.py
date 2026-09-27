@@ -90,13 +90,13 @@ AUDIO_CACHE_DIR   = os.getenv("AUDIO_CACHE_DIR",   "/audio_cache")
 AUDIO_CACHE_TTL   = int(os.getenv("AUDIO_CACHE_TTL",    "86400"))
 TOP_K_DEFAULT     = int(os.getenv("TOP_K_DEFAULT",      "3"))
 API_GATEWAY = os.getenv("API_GATEWAY")
-URL_EXPOSITIONS  = f"{API_GATEWAY}/expositions/api/expositions"
+URL_EXPOSITIONS  = f"{API_GATEWAY}/expositions/api/expositions?mode=all"
 URL_THEMES       = f"{API_GATEWAY}/expositions/api/themes"
 URL_SALLES       = f"{API_GATEWAY}/expositions/api/salles"
-URL_BIENS        = f"{API_GATEWAY}/biens/api/biens"
+URL_BIENS        = f"{API_GATEWAY}/biens/api/biens?mode=all"
 URL_CATEGORIES   = f"{API_GATEWAY}/biens/api/categories"
-URL_ARTISTES     = f"{API_GATEWAY}/users/api/artistes"
-URL_INSTITUTIONS = f"{API_GATEWAY}/institutions/api/institutions"
+URL_ARTISTES     = f"{API_GATEWAY}/users/api/artistes=all"
+URL_INSTITUTIONS = f"{API_GATEWAY}/institutions/api/institutions?mode=all"
 DATABASE_URL = "postgresql://postgres:123@localhost:5432/vectordb"
 conn = None  # Connexion à la base de données (si nécessaire)
 cur = None   # Curseur pour exécuter les requêtes SQL
