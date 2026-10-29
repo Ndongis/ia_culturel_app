@@ -955,7 +955,7 @@ def generate_answer(question: str, results: list,
         print(f"[AVANT GEN]...")  # Affiche les 200 premiers caractères du prompt
         # Requête à l'API Gemini
         response = _llm.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=prompt_complet,
         config=types.GenerateContentConfig(
         temperature=0.2,
@@ -1019,7 +1019,7 @@ def generate_suggested_questions(question: str | None = None, answer: str | None
    
     try:
         response = _llm.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-3.5-flash-lite",
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.4,
@@ -1781,7 +1781,7 @@ async def explain(req: ExplainRequest):
         try:
             t0     = time.time()
             answer = response = _llm.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-3.5-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                 temperature=0.2,
