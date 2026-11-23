@@ -95,7 +95,7 @@ URL_THEMES       = f"{API_GATEWAY}/expositions/api/themes"
 URL_SALLES       = f"{API_GATEWAY}/expositions/api/salles"
 URL_BIENS        = f"{API_GATEWAY}/biens/api/biens?mode=all"
 URL_CATEGORIES   = f"{API_GATEWAY}/biens/api/categories"
-URL_ARTISTES     = f"{API_GATEWAY}/users/api/artistes=all"
+URL_ARTISTES     = f"{API_GATEWAY}/users/api/artistes"
 URL_INSTITUTIONS = f"{API_GATEWAY}/institutions/api/institutions?mode=all"
 DATABASE_URL = "postgresql://postgres:123@localhost:5432/vectordb"
 conn = None  # Connexion à la base de données (si nécessaire)
